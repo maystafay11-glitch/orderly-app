@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <!--
+    Base href يُستبدل تلقائياً عند البناء بقيمة --base-href
+  -->
+  <base href="/orderly-app/">
+
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=Edge">
+  <meta name="description" content="Orderly — تطبيق لحساب أجور عمال التوصيل وصافي المطعم">
+
+  <!-- ═══════════════════════════════════════════════════════════
+       Viewport — ضروري للهواتف الذكية
+       ═══════════════════════════════════════════════════════════ -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+
+  <!-- ═══════════════════════════════════════════════════════════
+       Apple / iOS PWA Meta Tags
+       ═══════════════════════════════════════════════════════════ -->
+  <!-- تشغيل التطبيق بوضع Standalone (بدون شريط المتصفح) عند الإضافة للشاشة الرئيسية -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <!-- شريط الحالة: black-translucent يجعل المحتوى يمتد للأسفل من شريط الحالة -->
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <!-- اسم التطبيق كما يظهر تحت الأيقونة على الشاشة الرئيسية -->
+  <meta name="apple-mobile-web-app-title" content="Orderly">
+
+  <!-- أيقونات اللمس لأجهزة Apple بمقاسات متعددة -->
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+  <link rel="apple-touch-icon" sizes="152x152" href="icons/Icon-192.png">
+  <link rel="apple-touch-icon" sizes="167x167" href="icons/Icon-192.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/Icon-192.png">
+
+  <!-- ═══════════════════════════════════════════════════════════
+       iOS Splash Screens (Launch Images) — لمختلف أحجام الآيفون
+       ═══════════════════════════════════════════════════════════ -->
+  <!-- iPhone 14 Pro Max / 15 Pro Max (430×932) -->
+  <link rel="apple-touch-startup-image"
+        media="screen and (device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)"
+        href="splash/apple-splash-1290-2796.png">
+  <!-- iPhone 14 Pro / 15 Pro (393×852) -->
+  <link rel="apple-touch-startup-image"
+        media="screen and (device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)"
+        href="splash/apple-splash-1179-2556.png">
+  <!-- iPhone 14 / 13 / 12 (390×844) -->
+  <link rel="apple-touch-startup-image"
+        media="screen and (device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)"
+        href="splash/apple-splash-1170-2532.png">
+  <!-- iPhone SE 3 / 8 / 7 (375×667) -->
+  <link rel="apple-touch-startup-image"
+        media="screen and (device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)"
+        href="splash/apple-splash-750-1334.png">
+  <!-- iPhone XR / 11 (414×896) -->
+  <link rel="apple-touch-startup-image"
+        media="screen and (device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)"
+        href="splash/apple-splash-828-1792.png">
+  <!-- iPad Pro 12.9" -->
+  <link rel="apple-touch-startup-image"
+        media="screen and (device-width: 1024px) and (device-height: 1366px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)"
+        href="splash/apple-splash-2048-2732.png">
+
+  <!-- ═══════════════════════════════════════════════════════════
+       PWA Manifest & Favicon
+       ═══════════════════════════════════════════════════════════ -->
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" href="favicon.png">
+
+  <!-- ═══════════════════════════════════════════════════════════
+       Theme Color للمتصفح والـ PWA
+       ═══════════════════════════════════════════════════════════ -->
+  <meta name="theme-color" content="#0D0D0D">
+
+  <title>Orderly — أجور العمال</title>
+
+  <!-- ═══════════════════════════════════════════════════════════
+       Inline Style: شاشة تحميل أولية أثناء تحميل Flutter
+       ═══════════════════════════════════════════════════════════ -->
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background-color: #0D0D0D;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      /* دعم safe-area للشاشات ذات الشق (Notch) */
+      padding: env(safe-area-inset-top) env(safe-area-inset-right)
+               env(safe-area-inset-bottom) env(safe-area-inset-left);
+    }
+
+    #loading-screen {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 20px;
+      color: #ffffff;
+      opacity: 1;
+      transition: opacity 0.5s ease-out;
+    }
+
+    #loading-screen.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .app-icon {
+      width: 80px;
+      height: 80px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, #6C63FF, #4ECDC4);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 36px;
+    }
+
+    .app-name {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 1px;
+    }
+
+    .spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid rgba(108, 99, 255, 0.3);
+      border-top-color: #6C63FF;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- شاشة تحميل أثناء تهيئة Flutter engine -->
+  <div id="loading-screen">
+    <div class="app-icon">📋</div>
+    <div class="app-name">Orderly</div>
+    <div class="spinner"></div>
+  </div>
+
+  <script>
+    // إخفاء شاشة التحميل عند اكتمال تهيئة Flutter
+    window.addEventListener('flutter-first-frame', function () {
+      var loadingScreen = document.getElementById('loading-screen');
+      if (loadingScreen) {
+        loadingScreen.classList.add('hidden');
+        setTimeout(function () {
+          loadingScreen.remove();
+        }, 600);
+      }
+    });
+  </script>
+
+  <!--
+    flutter_bootstrap.js يُحمَّل تلقائياً عند بناء Flutter Web.
+    يمكن تخصيصه لإعدادات متقدمة:
+    https://docs.flutter.dev/platform-integration/web/initialization
+  -->
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>

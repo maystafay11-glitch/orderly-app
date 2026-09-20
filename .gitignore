@@ -1,0 +1,78 @@
+# Orderly App — .gitignore
+
+# ─── Dart/Flutter ────────────────────────────────────────────────
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/coverage/
+
+# Build output — نرفع فقط build/web للـ GitHub Pages
+/build/app/
+/build/android/
+/build/ios/
+/build/*.cache.dill.track.dill
+/build/f5283553ba0338257e6e4b1f161d845a/
+/build/camera_android_camerax/
+/build/flutter_plugin_android_lifecycle/
+/build/google_mlkit_commons/
+/build/google_mlkit_text_recognition/
+/build/jni/
+/build/jni_flutter/
+/build/native_assets/
+/build/native_hooks/
+/build/permission_handler_android/
+/build/reports/
+/build/shared_preferences_android/
+/build/test_cache/
+/build/unit_test_assets/
+/build/url_launcher_android/
+/build/.cxx/
+
+# ─── IntelliJ / Android Studio ──────────────────────────────────
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# ─── Android Release ─────────────────────────────────────────────
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# ─── iOS ─────────────────────────────────────────────────────────
+/ios/Flutter/.last_build_id
+
+# ─── OS / Misc ───────────────────────────────────────────────────
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+Thumbs.db
+
+# ─── Obfuscation / Symbols ───────────────────────────────────────
+app.*.symbols
+app.*.map.json
+
+# ─── Temp test files ─────────────────────────────────────────────
+analyze.txt
+analyze_err.txt
+analyze_out.txt
+stderr.txt
+stdout.txt
+test_ds.txt
+test_out.txt
+test_stderr.txt
+test_stderr2.txt
+test_stdout.txt
+wtest*.txt
+UTF8
