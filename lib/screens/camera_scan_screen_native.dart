@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
@@ -9,6 +12,7 @@ import 'package:orderly_app/screens/_permission_stub.dart'
 
 import 'package:orderly_app/services/ocr_service.dart';
 import 'package:orderly_app/theme/app_theme.dart';
+import 'package:orderly_app/utils/camera_web_support.dart';
 import 'package:orderly_app/utils/formatters.dart';
 import 'package:orderly_app/utils/jpeg_info.dart';
 import 'package:orderly_app/utils/scan_geometry.dart';
@@ -24,6 +28,54 @@ enum ScanStep {
   orderNumber,
 }
 
+/// سبب توقّف الكاميرا، ويُحدَّد منه الأزرار المعروضة للمستخدم.
+enum CameraFailureKind {
+  /// لا يوجد خطأ.
+  none,
+
+  /// إذن الكاميرا مرفوض أو محجوب من المتصفح/إعدادات النظام.
+  permission,
+
+  /// الكاميرا مستخدمة من تطبيق أو تبويب آخر (NotReadableError).
+  busy,
+
+  /// لا توجد كاميرا مطابقة على الجهاز.
+  notFound,
+
+  /// المتصفح/الجهاز لا يدعم الواجهة المطلوبة، أو الصفحة غير آمنة.
+  unsupported,
+
+  /// الصفحة تُخدم عبر بروتوكول غير آمن (http) فيمنع المتصفح الكاميرا.
+  insecureContext,
+
+  /// لم يستجب المتصفح خلال المهلة المحددة.
+  timeout,
+
+  /// خطأ غير معروف.
+  unknown,
+}
+
+/// استثناء داخلي يُرمى عند انتهاء مهلة تهيئة الكاميرا.
+class _CameraStartTimeoutException implements Exception {
+  const _CameraStartTimeoutException();
+
+  @override
+  String toString() => '_CameraStartTimeoutException';
+}
+
+/// وصف فشل تشغيل الكاميرا: نوعه + الرسالة العربية + هل الإذن مرفوض نهائياً.
+class _CameraFailure {
+  const _CameraFailure({
+    required this.kind,
+    required this.message,
+    this.permanentlyDenied = false,
+  });
+
+  final CameraFailureKind kind;
+  final String message;
+  final bool permanentlyDenied;
+}
+
 /// شاشة المسح بالكاميرا (OCR) مع الالتقاط المتتابع السريع (Continuous Scan Flow).
 ///
 /// تعمل بشكل متواصل دون إغلاق وفتح الكاميرا يدوياً بين الحقول:
@@ -32,6 +84,17 @@ enum ScanStep {
 ///    **رقم الطلب** ضمن نفس جلسة الكاميرا النشطة.
 /// 3. يدعم كشف السعر ورقم الطلب معاً في لقطة واحدة إن وُجدا في الفاتورة.
 /// 4. يتيح زر «تخطي والاعتماد» إن رغب الكاشير في الاكتفاء بالسعر فقط دون رقم طلب.
+///
+/// **على الويب (Flutter Web)**:
+/// * لا تُشغَّل الكاميرا تلقائياً عند فتح الشاشة؛ بل بعد فحص بيئة المتصفح
+///   (سياق آمن https + حالة إذن الكاميرا) وبعد **نقرة صريحة** من المستخدم،
+///   لأن متصفحات الجوال (Safari خصوصاً) ترفض تشغيل الكاميرا بدون تفاعل
+///   مباشر فتظهر معاينة سوداء.
+/// * عند أي فشل تُعرض رسالة دقيقة مع أزرار واضحة: «إعادة المحاولة»،
+///   «كيف أسمح بالكاميرا؟»، و«الإدخال اليدوي»، مع زر «إعادة تشغيل الكاميرا»
+///   داخل الشاشة بدون إغلاقها.
+/// * قراءة الأرقام تلقائياً (OCR) غير متاحة في المتصفح (google_mlkit لا يدعم
+///   Flutter Web)، فيُعرض تنبيه صريح بذلك مع إدخال يدوي بدل رسائل فشل مضللة.
 class CameraScanScreen extends StatefulWidget {
   const CameraScanScreen({
     super.key,
@@ -65,6 +128,21 @@ class _CameraScanScreenState extends State<CameraScanScreen>
   bool _permissionPermanentlyDenied = false;
   String? _error;
   String? _notice;
+
+  /// بيئة الكاميرا الناتجة عن الفحص (سياق آمن + دعم المتصفح + حالة الإذن).
+  CameraEnvironment? _environment;
+
+  /// نوع الفشل الحالي، ويُحدَّد منه الأزرار والنصائح المعروضة.
+  CameraFailureKind _failureKind = CameraFailureKind.none;
+
+  /// على الويب: الكاميرا جاهزة لكنها تنتظر نقرة صريحة من المستخدم لتشغيلها.
+  bool _awaitingUserGesture = false;
+
+  /// دقة الكاميرا المطلوبة (تُخفَّض تلقائياً إذا رفضها المتصفح).
+  ResolutionPreset _resolutionPreset = ResolutionPreset.high;
+
+  /// هل جرّبنا خفض الدقة بعد رفض الدقة الأعلى من قِبَل المتصفح؟
+  bool _didDowngradeResolution = false;
 
   /// الخطوة الحالية في الالتقاط المتتابع.
   late ScanStep _currentStep;
@@ -100,13 +178,14 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     _currentStep = widget.initialStep;
     _capturedPrice = widget.initialPrice;
     _capturedOrderNumber = widget.initialOrderNumber;
-    _initializeCamera();
+    _bootstrapCamera();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _controller?.dispose();
+    _controller = null;
     super.dispose();
   }
 
@@ -115,6 +194,18 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     if (_controller == null || !_controller!.value.isInitialized) {
       return;
     }
+
+    if (kIsWeb) {
+      // على الويب: إخفاء التبويب (أو ظهور نافذة إذن المتصفح) لا يعني فقدان
+      // الكاميرا. إعادة الطلب تلقائياً قد تُرفض لأن المتصفح يشترط تفاعلاً
+      // مباشراً، لذلك نكتفي بإعادة تشغيل المعاينة إن توقفت، ونترك للمستخدم
+      // زر «إعادة تشغيل الكاميرا» عند الحاجة.
+      if (state == AppLifecycleState.resumed) {
+        _ensurePreviewRunning();
+      }
+      return;
+    }
+
     if (state == AppLifecycleState.inactive) {
       _controller?.dispose();
       _controller = null;
@@ -126,87 +217,489 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     }
   }
 
-  /// طلب إذن الكاميرا ثم تشغيل الكاميرا الخلفية.
-  Future<void> _initializeCamera() async {
+  /// فحص بيئة الكاميرا أولاً، ثم تحديد طريقة التشغيل المناسبة للمنصة.
+  ///
+  /// * Android/iOS: تشغيل مباشر كما كان (إذن + كاميرا).
+  /// * الويب: فحص https ودعم المتصفح وحالة الإذن، ثم:
+  ///   1. إذا كان التشغيل مستحيلاً (http أو متصفح غير داعم) → رسالة واضحة.
+  ///   2. إذا كان الإذن مرفوضاً مسبقاً → إرشاد لتغييره من إعدادات الموقع.
+  ///   3. إذا كان الإذن ممنوحاً سابقاً → تشغيل تلقائي (لا حاجة لنافذة إذن).
+  ///   4. غير ذلك → شاشة انتظار بنقرة صريحة، لأن متصفحات الجوال تمنع
+  ///      تشغيل الكاميرا بدون تفاعل مباشر.
+  Future<void> _bootstrapCamera() async {
+    if (!kIsWeb) {
+      await _initializeCamera();
+      return;
+    }
+
     if (mounted) {
       setState(() {
         _isInitializing = true;
         _error = null;
         _notice = null;
+        _awaitingUserGesture = false;
+        _failureKind = CameraFailureKind.none;
       });
     }
 
+    final CameraEnvironment environment = await probeCameraEnvironment();
+    if (!mounted) {
+      return;
+    }
+
+    _environment = environment;
+
+    final String? blocking = environment.blockingMessage;
+    if (blocking != null) {
+      final bool insecure = !environment.isSecureContext;
+      setState(() {
+        _isInitializing = false;
+        _failureKind = insecure
+            ? CameraFailureKind.insecureContext
+            : (environment.permissionState == CameraPermissionState.denied
+                  ? CameraFailureKind.permission
+                  : CameraFailureKind.unsupported);
+        _permissionPermanentlyDenied =
+            environment.permissionState == CameraPermissionState.denied;
+        _error = blocking;
+      });
+      return;
+    }
+
+    if (environment.permissionState == CameraPermissionState.granted) {
+      // الإذن محفوظ مسبقاً: التشغيل التلقائي آمن ولا يعرض نافذة جديدة.
+      await _initializeCamera(fromUserGesture: true);
+      return;
+    }
+
+    setState(() {
+      _isInitializing = false;
+      _awaitingUserGesture = true;
+      _notice = null;
+    });
+  }
+
+  /// مهلة تهيئة الكاميرا.
+  ///
+  /// على الويب قد تبقى المعاينة سوداء دون أي استجابة، فلا نترك الشاشة
+  /// معلّقة بلا نهاية على زر التحميل.
+  Duration get _initializeTimeout => kIsWeb
+      ? const Duration(seconds: 25)
+      : const Duration(seconds: 15);
+
+  /// طلب إذن الكاميرا ثم تشغيل الكاميرا الخلفية.
+  ///
+  /// [fromUserGesture] يكون `true` عندما يأتي التشغيل من نقرة مباشرة
+  /// (زر «السماح وتشغيل الكاميرا» أو «إعادة المحاولة»)، وهو شرط أساسي
+  /// لتشغيل الكاميرا في متصفحات الجوال على الويب.
+  Future<void> _initializeCamera({bool fromUserGesture = false}) async {
+    if (mounted) {
+      setState(() {
+        _isInitializing = true;
+        _error = null;
+        _notice = null;
+        _awaitingUserGesture = false;
+        _failureKind = CameraFailureKind.none;
+        _permissionPermanentlyDenied = false;
+      });
+    }
+
+    // تنظيف أي جلسة سابقة قبل إعادة المحاولة (تمنع تعارض الكاميرا مع نفسها).
+    await _disposeController();
+
     try {
-      final PermissionStatus status = await Permission.camera.request();
-      if (!status.isGranted) {
-        if (!mounted) {
+      // 1) إذن الكاميرا:
+      //    * Android/iOS: عبر permission_handler.
+      //    * الويب: لا نستدعي permission_handler (غير مدعوم)؛ المتصفح نفسه
+      //      يطلب الإذن عند أول getUserMedia، وقد فُحصت حالته في _bootstrapCamera.
+      if (!kIsWeb) {
+        final PermissionStatus status = await Permission.camera.request();
+        if (!status.isGranted) {
+          _applyFailure(
+            _CameraFailure(
+              kind: CameraFailureKind.permission,
+              permanentlyDenied: status.isPermanentlyDenied,
+              message: status.isPermanentlyDenied
+                  ? 'تم رفض إذن الكاميرا نهائياً. افتح إعدادات التطبيق وامنح '
+                        'إذن الكاميرا ثم أعد المحاولة.'
+                  : 'لا يمكن المسح بالكاميرا دون السماح باستخدام الكاميرا.',
+            ),
+          );
           return;
         }
-        setState(() {
-          _isInitializing = false;
-          _permissionPermanentlyDenied = status.isPermanentlyDenied;
-          _error = status.isPermanentlyDenied
-              ? 'تم رفض إذن الكاميرا نهائياً. افتح إعدادات التطبيق وامنح '
-                    'إذن الكاميرا ثم أعد المحاولة.'
-              : 'لا يمكن المسح بالكاميرا دون السماح باستخدام الكاميرا.';
-        });
-        return;
       }
 
+      // 2) البحث عن الكاميرات المتاحة في الجهاز.
       final List<CameraDescription> cameras = await availableCameras();
       if (cameras.isEmpty) {
-        if (!mounted) {
-          return;
-        }
-        setState(() {
-          _isInitializing = false;
-          _error = 'لم يتم العثور على كاميرا في هذا الجهاز.';
-        });
+        _applyFailure(
+          const _CameraFailure(
+            kind: CameraFailureKind.notFound,
+            message: 'لم يتم العثور على كاميرا في هذا الجهاز.',
+          ),
+        );
         return;
       }
 
+      // 3) تفضيل الكاميرا الخلفية (الأنسب لقراءة الأرقام والأسعار).
       final CameraDescription description = cameras.firstWhere(
         (CameraDescription camera) =>
             camera.lensDirection == CameraLensDirection.back,
         orElse: () => cameras.first,
       );
 
+      // 4) إعدادات البدء الصحيحة للمتصفحات والجوال:
+      //    * enableAudio: false — الفيديو غير المكتوم قد يُمنع من التشغيل
+      //      تلقائياً على الويب فيبقى العنصر أسود.
+      //    * ResolutionPreset — يُخفَّض تلقائياً إلى medium إذا رفض المتصفح
+      //      الدقة المطلوبة (cameraOverconstrained).
       final CameraController controller = CameraController(
         description,
-        ResolutionPreset.high,
+        _resolutionPreset,
         enableAudio: false,
       );
-      await controller.initialize();
+
+      // 5) initialize() هي نقطة البدء الصحيحة في مكتبة camera الحديثة:
+      //    لا يوجد أسلوب start() في CameraController (0.12+)؛ فعلى الويب
+      //    يُنشئ initialize() عنصر <video> ويستدعي video.play() داخلياً،
+      //    وعند توقف المعاينة لاحقاً يُستخدم resumePreview() وهو البديل
+      //    المتوافق مع كل المتصفحات.
+      final Future<void> initializing = controller.initialize();
+      try {
+        await initializing.timeout(_initializeTimeout);
+      } on TimeoutException {
+        // إذا اكتمل التشغيل بعد انتهاء المهلة نُحرّر الكاميرا فوراً
+        // حتى لا تبقى مفتوحة في الخلفية.
+        unawaited(
+          initializing
+              .then((_) => controller.dispose())
+              .catchError((Object _) {}),
+        );
+        throw const _CameraStartTimeoutException();
+      }
 
       if (!mounted) {
         await controller.dispose();
         return;
       }
 
+      // 6) التأكد من وجود معاينة حقيقية (يمنع «الشاشة السوداء» الصامتة).
+      if (kIsWeb && controller.value.previewSize == null) {
+        await controller.dispose();
+        _applyFailure(
+          const _CameraFailure(
+            kind: CameraFailureKind.unsupported,
+            message:
+                'لم تُرجع الكاميرا صورة معاينة. تأكد من عدم استخدام الكاميرا في '
+                'تطبيق أو تبويب آخر، ثم أعد المحاولة.',
+          ),
+        );
+        return;
+      }
+
       setState(() {
         _controller = controller;
         _isInitializing = false;
+        _failureKind = CameraFailureKind.none;
       });
-    } on CameraException catch (exception) {
+
+      // 7) تشغيل المعاينة إن كانت متوقفة.
+      await _ensurePreviewRunning();
+    } catch (error) {
       if (!mounted) {
         return;
       }
-      setState(() {
-        _isInitializing = false;
-        _error = 'تعذّر تشغيل الكاميرا (${exception.code}).';
-      });
+
+      // دقة غير مدعومة: نُعيد المحاولة مرة واحدة بدقة أقل قبل إظهار خطأ.
+      if (kIsWeb &&
+          !_didDowngradeResolution &&
+          error is CameraException &&
+          (error.code == 'cameraOverconstrained' ||
+              error.code == 'cameraNotSupported')) {
+        _didDowngradeResolution = true;
+        _resolutionPreset = ResolutionPreset.medium;
+        await _initializeCamera(fromUserGesture: fromUserGesture);
+        return;
+      }
+
+      // على الويب: فشل التشغيل التلقائي (بدون نقرة) غالباً يعني أن المتصفح
+      // يطلب تفاعلاً مباشراً → نعرض شاشة النقرة بدل رسالة خطأ.
+      if (kIsWeb && !fromUserGesture && _isPermissionLikeFailure(error)) {
+        setState(() {
+          _isInitializing = false;
+          _awaitingUserGesture = true;
+          _error = null;
+          _failureKind = CameraFailureKind.none;
+          _notice = 'يحتاج المتصفح نقرة منك لتشغيل الكاميرا. اضغط الزر للسماح.';
+        });
+        return;
+      }
+
+      _applyFailure(_describeFailure(error));
+    }
+  }
+
+  /// عرض رسالة الفشل مع تحديد نوعه والأزرار المناسبة للإصلاح.
+  void _applyFailure(_CameraFailure failure) {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _isInitializing = false;
+      _awaitingUserGesture = false;
+      _failureKind = failure.kind;
+      _permissionPermanentlyDenied = failure.permanentlyDenied;
+      _error = failure.message;
+    });
+  }
+
+  /// إيقاف وتحرير الكاميرا الحالية.
+  ///
+  /// يُستدعى قبل كل إعادة محاولة وعند إغلاق الشاشة، لأن تشغيل كاميرا جديدة
+  /// فوق جلسة قديمة هو أكثر أسباب «الشاشة السوداء» على الويب (الكاميرا تكون
+  /// مشغولة بالتسجيل السابق).
+  Future<void> _disposeController() async {
+    final CameraController? controller = _controller;
+    _controller = null;
+    if (controller == null) {
+      return;
+    }
+    try {
+      await controller.dispose();
     } catch (_) {
-      if (!mounted) {
-        return;
+      // نتجاهل أخطاء الإغلاق: الجلسة قد تكون منتهية أصلاً.
+    }
+  }
+
+  /// إعادة تشغيل المعاينة إن كانت متوقفة.
+  ///
+  /// على الويب `resumePreview()` هي البديل المتوافق لأسلوب `start()` في
+  /// النسخ القديمة من المكتبة: تُعيد استدعاء `video.play()` على نفس البث
+  /// دون طلب إذن جديد ودون إعادة تهيئة كاملة.
+  Future<void> _ensurePreviewRunning() async {
+    final CameraController? controller = _controller;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    if (controller.value.isPreviewPaused) {
+      try {
+        await controller.resumePreview();
+      } catch (_) {
+        // إن فشل الاستئناف يبقى زر «إعادة تشغيل الكاميرا» متاحاً للمستخدم.
       }
-      setState(() {
-        _isInitializing = false;
-        _error = 'حدث خطأ غير متوقع أثناء تشغيل الكاميرا.';
-      });
+    }
+  }
+
+  /// زر احتياطي: إعادة تشغيل الكاميرا داخل الشاشة بدون إغلاقها.
+  ///
+  /// يجرّب أولاً استئناف المعاينة على نفس الجلسة (الأسرع)، وإن فشل يعيد
+  /// التهيئة الكاملة من نقطة الصفر.
+  Future<void> _restartCamera() async {
+    if (_isInitializing) {
+      return;
+    }
+
+    final CameraController? controller = _controller;
+    if (kIsWeb && controller != null && controller.value.isInitialized) {
+      try {
+        await controller.resumePreview();
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _error = null;
+          _notice = 'تم إعادة تشغيل الكاميرا.';
+          _failureKind = CameraFailureKind.none;
+        });
+        return;
+      } catch (_) {
+        // فشل الاستئناف → ننتقل لإعادة التهيئة الكاملة أدناه.
+      }
+    }
+
+    await _initializeCamera(fromUserGesture: true);
+  }
+
+  /// هل الفشل ناتج عن منع الإذن أو عن طلب الكاميرا بدون تفاعل مباشر؟
+  bool _isPermissionLikeFailure(Object error) {
+    if (error is! CameraException) {
+      return false;
+    }
+    switch (error.code) {
+      case 'CameraAccessDenied':
+      case 'CameraAccessDeniedWithoutPrompt':
+      case 'CameraAccessRestricted':
+      case 'cameraType':
+      case 'cameraSecurity':
+      case 'cameraUnknown':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /// تحويل خطأ المكتبة/المتصفح إلى رسالة عربية واضحة ونوع فشل معروف.
+  ///
+  /// أسماء الأخطاء تأتي من `camera_web` (مثل `CameraAccessDenied` و
+  /// `cameraNotFound`) ومن `permission_handler` على الأجهزة الأصلية.
+  _CameraFailure _describeFailure(Object error) {
+    if (error is _CameraStartTimeoutException) {
+      return _CameraFailure(
+        kind: CameraFailureKind.timeout,
+        message: kIsWeb
+            ? 'لم يستجب المتصفح خلال المهلة المحددة. تأكد من السماح بالكاميرا، '
+                  'وأغلق التطبيقات أو التبويبات الأخرى التي تستخدمها، ثم أعد المحاولة.'
+            : 'تأخّر تشغيل الكاميرا. أغلق التطبيقات التي تستخدم الكاميرا '
+                  'ثم أعد المحاولة.',
+      );
+    }
+
+    if (error is! CameraException) {
+      return const _CameraFailure(
+        kind: CameraFailureKind.unknown,
+        message: 'حدث خطأ غير متوقع أثناء تشغيل الكاميرا.',
+      );
+    }
+
+    switch (error.code) {
+      case 'CameraAccessDenied':
+      case 'CameraAccessDeniedWithoutPrompt':
+      case 'CameraAccessRestricted':
+        return _CameraFailure(
+          kind: CameraFailureKind.permission,
+          permanentlyDenied: true,
+          message: kIsWeb
+              ? 'إذن الكاميرا غير ممنوح لهذا الموقع، ولن يعرض المتصفح نافذة '
+                    'الطلب مرة أخرى.\n\n'
+                    'اضغط «كيف أسمح بالكاميرا؟» لمعرفة طريقة تفعيلها من إعدادات '
+                    'المتصفح، ثم أعد المحاولة.'
+              : 'تم رفض إذن الكاميرا. افتح إعدادات التطبيق وامنح إذن الكاميرا '
+                    'ثم أعد المحاولة.',
+        );
+      case 'AudioAccessDenied':
+      case 'AudioAccessDeniedWithoutPrompt':
+      case 'AudioAccessRestricted':
+        return const _CameraFailure(
+          kind: CameraFailureKind.permission,
+          permanentlyDenied: true,
+          message: 'تم رفض إذن الميكروفون، وهو مطلوب لهذه الكاميرا. امنح الإذن '
+              'ثم أعد المحاولة.',
+        );
+
+      case 'cameraNotReadable':
+        return const _CameraFailure(
+          kind: CameraFailureKind.busy,
+          message: 'الكاميرا مستخدمة حالياً من تطبيق أو تبويب آخر.\n\n'
+              'أغلق التطبيقات والتبويبات الأخرى التي تستخدم الكاميرا ثم أعد المحاولة.',
+        );
+      case 'cameraNotFound':
+        return const _CameraFailure(
+          kind: CameraFailureKind.notFound,
+          message: 'لم يتم العثور على كاميرا مطابقة في هذا الجهاز.',
+        );
+      case 'cameraOverconstrained':
+        return const _CameraFailure(
+          kind: CameraFailureKind.unsupported,
+          message: 'دقة الكاميرا المطلوبة غير مدعومة في هذا المتصفح أو الجهاز. '
+              'أعد المحاولة وسيُستخدم إعداد أدنى تلقائياً.',
+        );
+      case 'cameraNotSupported':
+      case 'cameraMissingMetadata':
+        return const _CameraFailure(
+          kind: CameraFailureKind.unsupported,
+          message: 'هذا المتصفح أو الجهاز لا يدعم تشغيل الكاميرا بالطريقة '
+              'المطلوبة. استخدم Chrome أو Safari بإصدار حديث.',
+        );
+      case 'cameraType':
+      case 'cameraSecurity':
+        return _CameraFailure(
+          kind: kIsWeb && _environment?.isSecureContext == false
+              ? CameraFailureKind.insecureContext
+              : CameraFailureKind.unsupported,
+          message: kIsWeb
+              ? 'رفض المتصفح تشغيل الكاميرا: تأكد من أن رابط التطبيق يبدأ بـ '
+                    'https:// وأن الإذن ممنوح للموقع.'
+              : 'رفض النظام تشغيل الكاميرا. تحقق من أذونات الكاميرا في إعدادات '
+                    'الجهاز.',
+        );
+      case 'cameraAbort':
+        return const _CameraFailure(
+          kind: CameraFailureKind.busy,
+          message: 'توقّف تشغيل الكاميرا بسبب مشكلة مؤقتة في الجهاز. أعد المحاولة.',
+        );
+      default:
+        return _CameraFailure(
+          kind: CameraFailureKind.unknown,
+          message: 'تعذّر تشغيل الكاميرا (${error.code}).',
+        );
     }
   }
 
   /// تبديل الفلاش لتسهيل القراءة في الإضاءة الخافتة.
+  /// خطوات السماح بالكاميرا لكل متصفح (تُعرض في نافذة المساعدة).
+  static const String _permissionHelpText =
+      'متصفح Chrome / Edge (أندرويد أو كمبيوتر):\n'
+      '• اضغط أيقونة الإعدادات (🔒 أو ⓘ) بجانب عنوان الموقع.\n'
+      '• اختر «الأذونات» ← «الكاميرا» ← «السماح».\n'
+      '• أعد تحميل الصفحة ثم اضغط «إعادة المحاولة».\n\n'
+      'متصفح Safari على iPhone/iPad:\n'
+      '• الإعدادات ← Safari ← الكاميرا ← «اسأل» أو «السماح».\n'
+      '• وفي الموقع: اضغط «أأ» بجانب العنوان ← «إعدادات موقع الويب» ← '
+      '«الكاميرا» ← «السماح».\n\n'
+      'عند استخدام التطبيق من الشاشة الرئيسية (PWA):\n'
+      '• احذف الأيقونة من الشاشة الرئيسية، ثم أضِفها مرة أخرى بعد منح الإذن.\n\n'
+      'ملاحظات مهمة:\n'
+      '• تشغيل الكاميرا يحتاج اتصالاً آمناً https:// وليس http://.\n'
+      '• لا بد من الضغط على زر التشغيل يدوياً؛ المتصفح لا يسمح بالتشغيل التلقائي.\n'
+      '• تأكد من عدم استخدام الكاميرا في تطبيق آخر (واتساب، تحرير الفيديو…).';
+
+  /// إظهار نافذة مساعدة توضح طريقة منح إذن الكاميرا في المتصفح.
+  Future<void> _showCameraPermissionHelp() async {
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return AlertDialog(
+          backgroundColor: AppColors.surface,
+          title: const Text(
+            'كيف أسمح بالكاميرا؟',
+            style: TextStyle(color: AppColors.textPrimary),
+          ),
+          content: SingleChildScrollView(
+            child: Text(
+              _permissionHelpText,
+              style: const TextStyle(
+                color: AppColors.textSecondary,
+                height: 1.8,
+                fontSize: 13,
+              ),
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              key: const ValueKey<String>('camera-help-close-button'),
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('حسناً'),
+            ),
+            FilledButton.icon(
+              key: const ValueKey<String>('camera-help-retry-button'),
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                _initializeCamera(fromUserGesture: true);
+              },
+              icon: const Icon(Icons.refresh, size: 18),
+              label: const Text('إعادة المحاولة'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// الخروج إلى الإدخال اليدوي مع الحفاظ على أي قيم تم التقاطها أو تمريرها.
+  void _exitWithManualEntry() {
+    _finishFlow();
+  }
+
   Future<void> _toggleTorch() async {
     final CameraController? controller = _controller;
     if (controller == null) {
@@ -266,6 +759,19 @@ class _CameraScanScreenState extends State<CameraScanScreen>
 
   /// تنفيذ الالتقاط ومعالجة النص بحسب الخطوة الحالية.
   Future<void> _captureAndRecognize() async {
+    // على الويب: لا توجد قراءة نصوص تلقائية (google_mlkit لا يدعم Flutter Web)،
+    // فنوضح ذلك بوضوح بدل إظهار «لم يتم العثور على أرقام» وهو غير صحيح.
+    if (!OcrService.isSupported) {
+      if (mounted) {
+        setState(() {
+          _notice =
+              'قراءة الأرقام تلقائياً غير متاحة في المتصفح. استخدم «الإدخال اليدوي» '
+              'أو افتح التطبيق على الجوال لقراءة الأسعار ورقم الطلب بالكاميرا.';
+        });
+      }
+      return;
+    }
+
     final CameraController? controller = _controller;
     if (controller == null ||
         !controller.value.isInitialized ||
@@ -477,6 +983,13 @@ class _CameraScanScreenState extends State<CameraScanScreen>
         foregroundColor: Colors.white,
         title: const Text(CameraScanScreen.title),
         actions: <Widget>[
+          // زر احتياطي: إعادة تشغيل الكاميرا بدون إغلاق الشاشة.
+          IconButton(
+            key: const ValueKey<String>('camera-restart-button'),
+            onPressed: _isInitializing ? null : _restartCamera,
+            tooltip: 'إعادة تشغيل الكاميرا',
+            icon: const Icon(Icons.refresh_rounded),
+          ),
           IconButton(
             onPressed: _controller == null ? null : _toggleTorch,
             tooltip: 'الفلاش',
@@ -502,20 +1015,48 @@ class _CameraScanScreenState extends State<CameraScanScreen>
             const CircularProgressIndicator(color: Colors.white),
             const SizedBox(height: 14),
             Text('جاري تشغيل الكاميرا…', style: style),
+            const SizedBox(height: 6),
+            Text(
+              kIsWeb ? 'اسمح بالكاميرا من نافذة المتصفح إن ظهرت.' : '',
+              textAlign: TextAlign.center,
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: Colors.white54),
+            ),
           ],
         ),
       );
     }
 
+    // على الويب: انتظار نقرة صريحة قبل تشغيل الكاميرا (شرط المتصفحات).
+    if (_awaitingUserGesture) {
+      return _buildWebStartCard();
+    }
+
     final String? error = _error;
     if (error != null) {
+      final bool isWebPermissionIssue =
+          kIsWeb &&
+          (_failureKind == CameraFailureKind.permission ||
+              _failureKind == CameraFailureKind.insecureContext);
+      final bool canOpenSettings =
+          !kIsWeb && _permissionPermanentlyDenied;
+
       return _ScanMessage(
-        icon: Icons.no_photography_outlined,
+        icon: _failureKind == CameraFailureKind.insecureContext
+            ? Icons.lock_outline_rounded
+            : Icons.no_photography_outlined,
         message: error,
         primaryLabel: 'إعادة المحاولة',
-        onPrimary: _initializeCamera,
-        secondaryLabel: _permissionPermanentlyDenied ? 'فتح الإعدادات' : null,
-        onSecondary: _permissionPermanentlyDenied ? () => openAppSettings() : null,
+        onPrimary: () => _initializeCamera(fromUserGesture: true),
+        secondaryLabel: isWebPermissionIssue
+            ? 'كيف أسمح بالكاميرا؟'
+            : (canOpenSettings ? 'فتح الإعدادات' : null),
+        onSecondary: isWebPermissionIssue
+            ? _showCameraPermissionHelp
+            : (canOpenSettings ? () => openAppSettings() : null),
+        manualLabel: 'الإدخال اليدوي',
+        onManual: _exitWithManualEntry,
       );
     }
 
@@ -574,6 +1115,100 @@ class _CameraScanScreenState extends State<CameraScanScreen>
           child: _buildBottomControls(),
         ),
       ],
+    );
+  }
+
+  /// بطاقة تشغيل الكاميرا على الويب (تنتظر نقرة صريحة من المستخدم).
+  ///
+  /// المتصفحات — وعلى رأسها Safari في iOS — ترفض تشغيل الكاميرا بدون تفاعل
+  /// مباشر، فبدل معاينة سوداء صامتة نعرض زراً واضحاً مع خيارات بديلة.
+  Widget _buildWebStartCard() {
+    final String? notice = _notice;
+    final TextTheme text = Theme.of(context).textTheme;
+
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(26),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Container(
+              width: 104,
+              height: 104,
+              decoration: BoxDecoration(
+                color: AppColors.surface,
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(
+                  color: AppColors.primary.withValues(alpha: 0.35),
+                  width: 2,
+                ),
+              ),
+              child: const Icon(
+                Icons.photo_camera_front_outlined,
+                size: 52,
+                color: AppColors.primary,
+              ),
+            ),
+            const SizedBox(height: 22),
+            const Text(
+              'تشغيل الكاميرا',
+              style: TextStyle(
+                color: AppColors.textPrimary,
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'اضغط الزر أدناه للسماح بالكاميرا وتشغيل المعاينة.\n'
+              'متصفحات الجوال (Safari وChrome) لا تسمح بتشغيل الكاميرا تلقائياً، '
+              'لذلك يظهر طلب الإذن عند الضغط فقط.',
+              textAlign: TextAlign.center,
+              style: text.bodyMedium?.copyWith(
+                color: AppColors.textSecondary,
+                height: 1.7,
+              ),
+            ),
+            if (notice != null) ...<Widget>[
+              const SizedBox(height: 18),
+              _ScanHint(text: notice, isWarning: true),
+            ],
+            const SizedBox(height: 22),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                key: const ValueKey<String>('camera-permission-button'),
+                onPressed: () => _initializeCamera(fromUserGesture: true),
+                icon: const Icon(Icons.play_arrow_rounded),
+                label: const Text('السماح وتشغيل الكاميرا'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppColors.primary,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 4),
+            TextButton.icon(
+              key: const ValueKey<String>('camera-permission-help-button'),
+              onPressed: _showCameraPermissionHelp,
+              icon: const Icon(Icons.help_outline, size: 18),
+              label: const Text('كيف أسمح بالكاميرا؟'),
+              style: TextButton.styleFrom(foregroundColor: Colors.white70),
+            ),
+            TextButton.icon(
+              key: const ValueKey<String>('camera-manual-entry-button'),
+              onPressed: _exitWithManualEntry,
+              icon: const Icon(Icons.keyboard_alt_outlined, size: 18),
+              label: const Text('الإدخال اليدوي'),
+              style: TextButton.styleFrom(foregroundColor: Colors.white70),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -690,6 +1325,30 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
+        // على الويب: قراءة الأرقام تلقائياً غير متاحة → نُظهر زر إدخال يدوي
+        // واضحاً فوق زر الالتقاط بدل ترك المستخدم ينتظر قراءة لن تحدث.
+        if (!OcrService.isSupported) ...<Widget>[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+            child: SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                key: const ValueKey<String>('camera-manual-entry-button'),
+                onPressed: _isProcessing ? null : _exitWithManualEntry,
+                icon: const Icon(Icons.keyboard_alt_outlined, size: 18),
+                label: const Text('إدخال السعر ورقم الطلب يدوياً'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppColors.primary,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
         // عند خطوة رقم الطلب: زر تخطي ورقم السعر المحفوظ
         if (isOrderNumberStep) ...<Widget>[
           Padding(
@@ -749,18 +1408,55 @@ class _CameraPreviewBox extends StatelessWidget {
       return const ColoredBox(color: Colors.black);
     }
 
-    return ClipRect(
-      child: OverflowBox(
-        alignment: Alignment.center,
-        child: FittedBox(
-          fit: BoxFit.cover,
-          child: SizedBox(
-            width: previewSize.height,
-            height: previewSize.width,
-            child: CameraPreview(controller),
+    // مكتبة camera تُرجع أبعاد المعاينة بالوضع الأفقي، فنبدّل العرض والارتفاع
+    // لتظهر المعاينة بالوضع الرأسي الصحيح على الجوال.
+    final double videoWidth = previewSize.height;
+    final double videoHeight = previewSize.width;
+
+    if (!kIsWeb) {
+      return ClipRect(
+        child: OverflowBox(
+          alignment: Alignment.center,
+          child: FittedBox(
+            fit: BoxFit.cover,
+            child: SizedBox(
+              width: videoWidth,
+              height: videoHeight,
+              child: CameraPreview(controller),
+            ),
           ),
         ),
-      ),
+      );
+    }
+
+    // ─── الويب ──────────────────────────────────────────────────────────
+    // عنصر <video> في camera_web هو Platform View داخل الصفحة، وتمريره عبر
+    // FittedBox/Transform يُنتج معاينة سوداء على بعض المتصفحات (Safari في
+    // iOS خصوصاً). لذلك نحسب مقاس «الغلاف» (BoxFit.cover) يدوياً ونمرّره
+    // كحجم فعلي للعنصر، فيبقى الفيديو ممتداً بلا أي تحويل CSS.
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final double viewWidth = constraints.maxWidth;
+        final double viewHeight = constraints.maxHeight;
+        if (viewWidth <= 0 || viewHeight <= 0) {
+          return const ColoredBox(color: Colors.black);
+        }
+
+        final double scale = math.max(
+          viewWidth / videoWidth,
+          viewHeight / videoHeight,
+        );
+
+        return ClipRect(
+          child: Center(
+            child: SizedBox(
+              width: videoWidth * scale,
+              height: videoHeight * scale,
+              child: CameraPreview(controller),
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -883,6 +1579,8 @@ class _ScanMessage extends StatelessWidget {
     required this.onPrimary,
     this.secondaryLabel,
     this.onSecondary,
+    this.manualLabel,
+    this.onManual,
   });
 
   final IconData icon;
@@ -892,10 +1590,15 @@ class _ScanMessage extends StatelessWidget {
   final String? secondaryLabel;
   final VoidCallback? onSecondary;
 
+  /// زر احتياطي للخروج إلى الإدخال اليدوي (يظهر دائماً عند توفره).
+  final String? manualLabel;
+  final VoidCallback? onManual;
+
   @override
   Widget build(BuildContext context) {
     final TextTheme text = Theme.of(context).textTheme;
     final String? secondary = secondaryLabel;
+    final String? manual = manualLabel;
 
     return Center(
       child: SingleChildScrollView(
@@ -926,6 +1629,22 @@ class _ScanMessage extends StatelessWidget {
                 child: Text(
                   secondary,
                   style: text.bodyMedium?.copyWith(color: Colors.white70),
+                ),
+              ),
+            ],
+            if (manual != null) ...<Widget>[
+              const SizedBox(height: 6),
+              TextButton.icon(
+                key: const ValueKey<String>('camera-manual-entry-button'),
+                onPressed: onManual,
+                icon: const Icon(
+                  Icons.keyboard_alt_outlined,
+                  size: 18,
+                  color: Colors.white54,
+                ),
+                label: Text(
+                  manual,
+                  style: text.bodyMedium?.copyWith(color: Colors.white54),
                 ),
               ),
             ],

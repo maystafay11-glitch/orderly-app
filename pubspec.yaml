@@ -42,6 +42,10 @@ dependencies:
   permission_handler: 12.0.3
   url_launcher: ^6.3.1
 
+  # واجهات المتصفح (DOM) — تُستخدم فقط على Flutter Web لفحص بيئة الكاميرا
+  # (السياق الآمن + حالة إذن الكاميرا) عبر lib/utils/camera_web_support.dart.
+  web: ^1.1.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

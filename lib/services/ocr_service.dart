@@ -67,6 +67,13 @@ class OcrResult {
 class OcrService {
   const OcrService._();
 
+  /// هل تدعم هذه المنصة قراءة النصوص تلقائياً (OCR)؟
+  ///
+  /// * Android/iOS/الكمبيوتر: `true` (عبر google_mlkit).
+  /// * الويب: `false` لأن google_mlkit لا يدعم Flutter Web؛ وفي هذه الحالة
+  ///   تُعرض في شاشة المسح رسالة صحيحة مع إدخال يدوي بدل رسائل فشل مضللة.
+  static const bool isSupported = !kIsWeb;
+
   /// نمط الأرقام: `1500` أو `1,500` أو `1.500` أو `12.5`.
   static final RegExp _numberPattern = RegExp(r'\d+(?:[.,]\d+)*');
 
