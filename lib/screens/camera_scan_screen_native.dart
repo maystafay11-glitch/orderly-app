@@ -1,11 +1,12 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:image_picker/image_picker.dart';
 
 // permission_handler غير مدعوم على الويب — نستورده شرطياً
 import 'package:orderly_app/screens/_permission_stub.dart'
@@ -13,12 +14,13 @@ import 'package:orderly_app/screens/_permission_stub.dart'
 
 import 'package:orderly_app/services/ocr_service.dart';
 import 'package:orderly_app/theme/app_theme.dart';
-import 'package:orderly_app/utils/camera_web_support.dart';
 import 'package:orderly_app/utils/formatters.dart';
+import 'package:orderly_app/utils/image_preprocess.dart';
 import 'package:orderly_app/utils/jpeg_info.dart';
 import 'package:orderly_app/utils/live_scan_payload.dart';
 import 'package:orderly_app/utils/scan_geometry.dart';
-import 'package:orderly_app/utils/web_camera_playback.dart';
+import 'package:orderly_app/utils/web_image_barcode.dart';
+import 'package:orderly_app/utils/web_text_ocr.dart';
 import 'package:orderly_app/widgets/scan_overlay.dart';
 
 /// خطوات الالتقاط المتتابع (Continuous Scan Flow):
@@ -132,14 +134,8 @@ class _CameraScanScreenState extends State<CameraScanScreen>
   String? _error;
   String? _notice;
 
-  /// بيئة الكاميرا الناتجة عن الفحص (سياق آمن + دعم المتصفح + حالة الإذن).
-  CameraEnvironment? _environment;
-
   /// نوع الفشل الحالي، ويُحدَّد منه الأزرار والنصائح المعروضة.
   CameraFailureKind _failureKind = CameraFailureKind.none;
-
-  /// على الويب: الكاميرا جاهزة لكنها تنتظر نقرة صريحة من المستخدم لتشغيلها.
-  bool _awaitingUserGesture = false;
 
   /// دقة الكاميرا المطلوبة (تُخفَّض تلقائياً إذا رفضها المتصفح).
   ResolutionPreset _resolutionPreset = ResolutionPreset.high;
@@ -147,28 +143,22 @@ class _CameraScanScreenState extends State<CameraScanScreen>
   /// هل جرّبنا خفض الدقة بعد رفض الدقة الأعلى من قِبَل المتصفح؟
   bool _didDowngradeResolution = false;
 
-  // ─── الويب: المسح التلقائي المباشر (mobile_scanner) ──────────────────────
+  // ─── الويب: مسار الصورة الثابتة (Snapshot) ──────────────────────────────
 
-  /// وحدة التحكم بالماسح التلقائي المباشر على الويب.
-  MobileScannerController? _liveScanner;
+  /// منتقي الصور: يفتح كاميرا الجهاز أو معرض الصور بلا أي بث فيديو مباشر.
+  final ImagePicker _imagePicker = ImagePicker();
 
-  /// هل الماسح المباشر قيد التشغيل الآن؟
-  bool _liveScannerRunning = false;
+  /// بايتات الصورة الملتقطة حالياً (تُعرض داخل إطار المسح للمراجعة).
+  Uint8List? _snapshotBytes;
 
-  /// آخر لحظة قُبلت فيها قراءة مباشرة (تمنع تكرار نفس النتيجة بسرعة).
-  DateTime? _lastLiveReadAt;
+  /// أبعاد الصورة الملتقطة بالبكسل (لتحويل إطار المسح إلى منطقة داخلها).
+  Size? _snapshotSize;
 
-  /// آخر قيمة قُرئت مباشرة (تمنع معالجة نفس الباركود مراراً).
-  String? _lastLiveValue;
+  /// هل يجري فكّ الصورة وقراءة الأرقام منها الآن؟
+  bool _isReadingSnapshot = false;
 
-  /// متى بدأ التشغيل المباشر (يُستخدم لمنع تنبيه الاحتياط قبل الأوان).
-  DateTime? _liveStartedAt;
-
-  /// هل عُرض تنبيه «لم تُقرأ أي قيمة»؟ (يُعرض مرة واحدة).
-  bool _liveFallbackNoticeShown = false;
-
-  /// مؤقّت مراقبة القراءة التلقائية على الويب.
-  Timer? _liveWatchdogTimer;
+  /// أبعاد منطقة المعاينة الحالية (تُستخدم لحساب إطار المسح).
+  Size? _previewSize;
 
   /// الخطوة الحالية في الالتقاط المتتابع.
   late ScanStep _currentStep;
@@ -210,9 +200,6 @@ class _CameraScanScreenState extends State<CameraScanScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _liveWatchdogTimer?.cancel();
-    _liveWatchdogTimer = null;
-    _disposeLiveScanner();
     _controller?.dispose();
     _controller = null;
     super.dispose();
@@ -220,18 +207,9 @@ class _CameraScanScreenState extends State<CameraScanScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // على الويب: نُبقي جلسة الكاميرا كما هي ونوقف التحليل مؤقتاً فقط،
-    // لأن إعادة طلب الأذن بعد إخفاء التبويب قد تحتاج تفاعلاً من المستخدم.
+    // على الويب لا توجد جلسة كاميرا مباشرة نُديرها (الالتقاط يتم عبر كاميرا
+    // الجهاز عند الطلب)، فلا حاجة لأي معالجة هنا.
     if (kIsWeb) {
-      if (_liveScanner == null) {
-        return;
-      }
-      if (state == AppLifecycleState.resumed) {
-        unawaited(_resumeLiveScanner());
-      } else if (state == AppLifecycleState.inactive ||
-          state == AppLifecycleState.paused) {
-        unawaited(_pauseLiveScanner());
-      }
       return;
     }
 
@@ -250,15 +228,12 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     }
   }
 
-  /// فحص بيئة الكاميرا أولاً، ثم تحديد طريقة التشغيل المناسبة للمنصة.
+  /// تهيئة الشاشة بحسب المنصة:
   ///
-  /// * Android/iOS: تشغيل مباشر كما كان (إذن + كاميرا).
-  /// * الويب: فحص https ودعم المتصفح وحالة الإذن، ثم:
-  ///   1. إذا كان التشغيل مستحيلاً (http أو متصفح غير داعم) → رسالة واضحة.
-  ///   2. إذا كان الإذن مرفوضاً مسبقاً → إرشاد لتغييره من إعدادات الموقع.
-  ///   3. إذا كان الإذن ممنوحاً سابقاً → تشغيل تلقائي (لا حاجة لنافذة إذن).
-  ///   4. غير ذلك → شاشة انتظار بنقرة صريحة، لأن متصفحات الجوال تمنع
-  ///      تشغيل الكاميرا بدون تفاعل مباشر.
+  /// * Android/iOS: طلب إذن الكاميرا ثم تشغيل الكاميرا وقراءة الأرقام (OCR).
+  /// * الويب: **لا بث فيديو مباشر إطلاقاً** — شاشة التقاط صورة (Snapshot)
+  ///   تعتمد على كاميرا الجهاز أو معرض الصور، فيسقط احتمال «الشاشة السوداء»
+  ///   من أساسه لأنه لا يوجد عنصر فيديو ننتظره.
   Future<void> _bootstrapCamera() async {
     if (!kIsWeb) {
       await _initializeCamera();
@@ -267,249 +242,14 @@ class _CameraScanScreenState extends State<CameraScanScreen>
 
     if (mounted) {
       setState(() {
-        _isInitializing = true;
-        _error = null;
-        _notice = null;
-        _awaitingUserGesture = false;
-        _failureKind = CameraFailureKind.none;
-      });
-    }
-
-    final CameraEnvironment environment = await probeCameraEnvironment();
-    if (!mounted) {
-      return;
-    }
-
-    _environment = environment;
-
-    final String? blocking = environment.blockingMessage;
-    if (blocking != null) {
-      final bool insecure = !environment.isSecureContext;
-      setState(() {
         _isInitializing = false;
-        _failureKind = insecure
-            ? CameraFailureKind.insecureContext
-            : (environment.permissionState == CameraPermissionState.denied
-                  ? CameraFailureKind.permission
-                  : CameraFailureKind.unsupported);
-        _permissionPermanentlyDenied =
-            environment.permissionState == CameraPermissionState.denied;
-        _error = blocking;
-      });
-      return;
-    }
-
-    if (environment.permissionState == CameraPermissionState.granted) {
-      // الإذن محفوظ مسبقاً: التشغيل التلقائي آمن ولا يعرض نافذة جديدة.
-      await _startLiveScanner(fromUserGesture: true);
-      return;
-    }
-
-    setState(() {
-      _isInitializing = false;
-      _awaitingUserGesture = true;
-      _notice = null;
-    });
-  }
-
-  /// تشغيل الكاميرا بالطريقة المناسبة للمنصة.
-  ///
-  /// * الويب: الماسح التلقائي المباشر (`mobile_scanner`) الذي يقرأ الباركود/QR
-  ///   داخل إطار التحديد في الوقت الفعلي.
-  /// * Android/iOS: الكاميرا + OCR كما هو (قراءة الأرقام من الصور).
-  Future<void> _startCamera({bool fromUserGesture = false}) {
-    if (kIsWeb) {
-      return _startLiveScanner(fromUserGesture: fromUserGesture);
-    }
-    return _initializeCamera(fromUserGesture: fromUserGesture);
-  }
-
-  /// تشغيل المسح التلقائي المباشر على الويب.
-  ///
-  /// إعدادات البدء المهمة على الويب:
-  /// * `autoStart: false` ثم استدعاء `start()` من نقرة المستخدم، لأن المتصفحات
-  ///   (Safari في iOS خصوصاً) ترفض فتح الكاميرا بلا تفاعل مباشر.
-  /// * `cameraResolution: 1280×720` لتخفيف الحمل على معالج الهاتف مع وضوح كافٍ
-  ///   لقراءة الباركود (الافتراضي في تنفيذ الويب هو 1920×1080).
-  /// * `detectionTimeoutMs: 140` لضبط معدّل التحليل (~7 إطارات/ثانية) ليكون
-  ///   المسح فورياً وخفيفاً على متصفحات الموبايل.
-  /// * إطار التحليل هو إطار التحديد المرئي (`scanWindow`) فلا يُقرأ إلا ما
-  ///   يقع داخل المربع.
-  Future<void> _startLiveScanner({bool fromUserGesture = false}) async {
-    if (mounted) {
-      setState(() {
-        _isInitializing = true;
         _error = null;
         _notice = null;
-        _awaitingUserGesture = false;
         _failureKind = CameraFailureKind.none;
         _permissionPermanentlyDenied = false;
       });
     }
-
-    final MobileScannerController controller =
-        _liveScanner ??
-        MobileScannerController(
-          autoStart: false,
-          cameraResolution: const Size(1280, 720),
-          facing: CameraFacing.back,
-          formats: const <BarcodeFormat>[],
-          detectionSpeed: DetectionSpeed.normal,
-          detectionTimeoutMs: 140,
-        );
-    _liveScanner = controller;
-
-    try {
-      // start() يطلب إذن الكاميرا من المتصفح (getUserMedia) ثم يبدأ التحليل،
-      // وينتظر تلقائياً ارتباط الماسح بالودجت قبل التشغيل.
-      await controller.start();
-      if (!mounted) {
-        return;
-      }
-      _lastLiveReadAt = null;
-      _lastLiveValue = null;
-      setState(() {
-        _isInitializing = false;
-        _liveScannerRunning = true;
-        _liveStartedAt = DateTime.now();
-        _liveFallbackNoticeShown = false;
-      });
-      await _hardenWebPlayback();
-      _scheduleLiveFallbackNotice();
-    } on MobileScannerException catch (error) {
-      _applyFailure(_describeLiveScanFailure(error));
-    } catch (error) {
-      _applyFailure(_describeLiveScanFailure(error));
-    }
   }
-
-  /// إيقاف الماسح المباشر وتحرير موارده.
-  void _disposeLiveScanner() {
-    final MobileScannerController? scanner = _liveScanner;
-    _liveScanner = null;
-    _liveScannerRunning = false;
-    if (scanner == null) {
-      return;
-    }
-    unawaited(scanner.dispose().then<void>((_) {}, onError: (Object _) {}));
-  }
-
-  /// إيقاف التحليل مؤقتاً عند إخفاء التبويب (تبقى الجلسة محفوظة).
-  Future<void> _pauseLiveScanner() async {
-    final MobileScannerController? scanner = _liveScanner;
-    if (scanner == null || !scanner.value.isRunning) {
-      return;
-    }
-    try {
-      await scanner.pause();
-      if (mounted) {
-        setState(() => _liveScannerRunning = false);
-      }
-    } catch (_) {
-      // نترك للمستخدم زر «إعادة تشغيل الكاميرا» عند الحاجة.
-    }
-  }
-
-  /// استئناف التحليل بعد العودة إلى التبويب (بدون طلب إذن جديد).
-  Future<void> _resumeLiveScanner() async {
-    final MobileScannerController? scanner = _liveScanner;
-    if (scanner == null) {
-      return;
-    }
-    try {
-      await scanner.start();
-      if (!mounted) {
-        return;
-      }
-      setState(() => _liveScannerRunning = true);
-      await _hardenWebPlayback();
-    } catch (_) {
-      // إن فشل الاستئناف يبقى زر إعادة التشغيل متاحاً للمستخدم.
-    }
-  }
-
-  /// زر إعادة التشغيل على الويب: يعيد تشغيل الماسح بدون إغلاق الشاشة.
-  Future<void> _restartLiveScanner() async {
-    if (_isInitializing) {
-      return;
-    }
-
-    final MobileScannerController? scanner = _liveScanner;
-    if (scanner != null && scanner.value.isRunning) {
-      // الماسح يعمل: نتحقق من أن عنصر الفيديو يعرض البث فعلاً.
-      final WebCameraPlaybackState playback = await ensureWebCameraPlayback();
-      if (playback == WebCameraPlaybackState.playing) {
-        if (mounted) {
-          setState(() {
-            _error = null;
-            _failureKind = CameraFailureKind.none;
-            _notice = 'المسح التلقائي يعمل. ضع الباركود داخل المربع.';
-          });
-        }
-        return;
-      }
-    }
-
-    await _startLiveScanner(fromUserGesture: true);
-  }
-
-  /// تحصين تشغيل عنصر الفيديو (playsinline/muted/autoplay) على الويب.
-  ///
-  /// بعض المتصفحات — وSafari في iOS خصوصاً — لا تعرض بث الكاميرا إلا بخصائص
-  /// محددة، وإلا بقيت المعاينة سوداء رغم أن الكاميرا تعمل.
-  Future<void> _hardenWebPlayback() async {
-    if (!kIsWeb) {
-      return;
-    }
-    for (final Duration delay in const <Duration>[
-      Duration.zero,
-      Duration(milliseconds: 350),
-      Duration(milliseconds: 1200),
-    ]) {
-      if (!mounted || _liveScanner == null) {
-        return;
-      }
-      if (delay > Duration.zero) {
-        await Future<void>.delayed(delay);
-      }
-      final WebCameraPlaybackState state = await ensureWebCameraPlayback();
-      if (state == WebCameraPlaybackState.playing) {
-        return;
-      }
-    }
-  }
-
-  /// تنبيه احتياطي إن لم تُقرأ أي قيمة خلال مدة معقولة.
-  ///
-  /// يضمن ألا يبقى المستخدم أمام كاميرا تعمل بلا نتيجة دون بديل واضح.
-  void _scheduleLiveFallbackNotice() {
-    _liveWatchdogTimer?.cancel();
-    _liveWatchdogTimer = Timer(const Duration(seconds: 12), () {
-      if (!mounted || _liveFallbackNoticeShown || _liveScanner == null) {
-        return;
-      }
-      if (_stepSucceeded || _isProcessing) {
-        return;
-      }
-      setState(() {
-        _liveFallbackNoticeShown = true;
-        _notice =
-            'لم يُقرأ أي باركود خلال $_liveScanElapsedSeconds ثانية. قرّب '
-            'الكاميرا أكثر أو استخدم «الإدخال اليدوي». الأرقام المطبوعة بدون '
-            'باركود تُدخل يدوياً.';
-      });
-    });
-  }
-
-  /// كم مضى على بدء التشغيل المباشر (بالثواني).
-  int get _liveScanElapsedSeconds {
-    final DateTime? started = _liveStartedAt;
-    if (started == null) {
-      return 0;
-    }
-    return DateTime.now().difference(started).inSeconds;
-  }
-
   /// مهلة تهيئة الكاميرا.
   ///
   /// على الويب قد تبقى المعاينة سوداء دون أي استجابة، فلا نترك الشاشة
@@ -529,7 +269,6 @@ class _CameraScanScreenState extends State<CameraScanScreen>
         _isInitializing = true;
         _error = null;
         _notice = null;
-        _awaitingUserGesture = false;
         _failureKind = CameraFailureKind.none;
         _permissionPermanentlyDenied = false;
       });
@@ -653,19 +392,6 @@ class _CameraScanScreenState extends State<CameraScanScreen>
         return;
       }
 
-      // على الويب: فشل التشغيل التلقائي (بدون نقرة) غالباً يعني أن المتصفح
-      // يطلب تفاعلاً مباشراً → نعرض شاشة النقرة بدل رسالة خطأ.
-      if (kIsWeb && !fromUserGesture && _isPermissionLikeFailure(error)) {
-        setState(() {
-          _isInitializing = false;
-          _awaitingUserGesture = true;
-          _error = null;
-          _failureKind = CameraFailureKind.none;
-          _notice = 'يحتاج المتصفح نقرة منك لتشغيل الكاميرا. اضغط الزر للسماح.';
-        });
-        return;
-      }
-
       _applyFailure(_describeFailure(error));
     }
   }
@@ -677,7 +403,6 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     }
     setState(() {
       _isInitializing = false;
-      _awaitingUserGesture = false;
       _failureKind = failure.kind;
       _permissionPermanentlyDenied = failure.permanentlyDenied;
       _error = failure.message;
@@ -721,13 +446,13 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     }
   }
 
-  /// زر احتياطي: إعادة تشغيل الكاميرا داخل الشاشة بدون إغلاقها.
+  /// زر احتياطي في الشريط العلوي.
   ///
-  /// على الويب يعيد تشغيل الماسح التلقائي المباشر، وعلى الأجهزة الأصلية
-  /// يجرّب أولاً استئناف المعاينة على نفس الجلسة (الأسرع) ثم يعيد التهيئة.
+  /// * الويب: يمسح الصورة الحالية للبدء من جديد (لا يوجد بث فيديو لإعادة تشغيله).
+  /// * الأجهزة الأصلية: يجرّب استئناف المعاينة على نفس الجلسة ثم يعيد التهيئة.
   Future<void> _restartCamera() async {
     if (kIsWeb) {
-      await _restartLiveScanner();
+      _resetSnapshot();
       return;
     }
 
@@ -736,7 +461,7 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     }
 
     final CameraController? controller = _controller;
-    if (kIsWeb && controller != null && controller.value.isInitialized) {
+    if (controller != null && controller.value.isInitialized) {
       try {
         await controller.resumePreview();
         if (!mounted) {
@@ -755,25 +480,6 @@ class _CameraScanScreenState extends State<CameraScanScreen>
 
     await _initializeCamera(fromUserGesture: true);
   }
-
-  /// هل الفشل ناتج عن منع الإذن أو عن طلب الكاميرا بدون تفاعل مباشر؟
-  bool _isPermissionLikeFailure(Object error) {
-    if (error is! CameraException) {
-      return false;
-    }
-    switch (error.code) {
-      case 'CameraAccessDenied':
-      case 'CameraAccessDeniedWithoutPrompt':
-      case 'CameraAccessRestricted':
-      case 'cameraType':
-      case 'cameraSecurity':
-      case 'cameraUnknown':
-        return true;
-      default:
-        return false;
-    }
-  }
-
   /// تحويل خطأ المكتبة/المتصفح إلى رسالة عربية واضحة ونوع فشل معروف.
   ///
   /// أسماء الأخطاء تأتي من `camera_web` (مثل `CameraAccessDenied` و
@@ -848,15 +554,10 @@ class _CameraScanScreenState extends State<CameraScanScreen>
         );
       case 'cameraType':
       case 'cameraSecurity':
-        return _CameraFailure(
-          kind: kIsWeb && _environment?.isSecureContext == false
-              ? CameraFailureKind.insecureContext
-              : CameraFailureKind.unsupported,
-          message: kIsWeb
-              ? 'رفض المتصفح تشغيل الكاميرا: تأكد من أن رابط التطبيق يبدأ بـ '
-                    'https:// وأن الإذن ممنوح للموقع.'
-              : 'رفض النظام تشغيل الكاميرا. تحقق من أذونات الكاميرا في إعدادات '
-                    'الجهاز.',
+        return const _CameraFailure(
+          kind: CameraFailureKind.unsupported,
+          message: 'رفض النظام تشغيل الكاميرا. تحقق من أذونات الكاميرا في إعدادات '
+              'الجهاز.',
         );
       case 'cameraAbort':
         return const _CameraFailure(
@@ -870,219 +571,6 @@ class _CameraScanScreenState extends State<CameraScanScreen>
         );
     }
   }
-
-  /// تبديل الفلاش لتسهيل القراءة في الإضاءة الخافتة.
-  /// معالجة نتيجة المسح التلقائي المباشر (باركود/QR) على الويب.
-  ///
-  /// التحليل خفيف: لا صور ولا إطارات، بل نص الباركود فقط، مع تنظيم للمعدّل
-  /// ومنع تكرار نتائج متطابقة حتى يبقى الأداء جيداً على متصفحات الموبايل.
-  void _onLiveBarcodeDetected(BarcodeCapture capture) {
-    if (!mounted || _isProcessing || _stepSucceeded || capture.barcodes.isEmpty) {
-      return;
-    }
-
-    final DateTime now = DateTime.now();
-    final DateTime? last = _lastLiveReadAt;
-
-    // 1) قراءة واحدة كل 450 مللي ثانية كحد أقصى (منع إغراق الواجهة).
-    if (last != null &&
-        now.difference(last) < const Duration(milliseconds: 450)) {
-      return;
-    }
-
-    final Barcode? barcode = _pickLiveBarcode(capture);
-    final String? payload = barcode?.rawValue ?? barcode?.displayValue;
-    if (payload == null || payload.trim().isEmpty) {
-      return;
-    }
-
-    // 2) تجاهل نفس الباركود إذا قُرئ قبل أقل من 3 ثوان.
-    if (payload == _lastLiveValue &&
-        last != null &&
-        now.difference(last) < const Duration(seconds: 3)) {
-      return;
-    }
-    _lastLiveReadAt = now;
-    _lastLiveValue = payload;
-
-    // 3) تحويل الحمولة إلى سعر و/أو رقم طلب بحسب الخطوة الحالية.
-    final LiveScanPayload parsed = LiveScanPayload.parse(
-      payload,
-      target: _currentStep == ScanStep.price
-          ? LiveScanTarget.price
-          : LiveScanTarget.orderNumber,
-    );
-
-    if (parsed.isEmpty) {
-      setState(() {
-        _notice =
-            'تم قراءة باركود لا يحتوي على رقم طلب أو سعر واضح. استخدم '
-            '«الإدخال اليدوي» لإدخال القيمة.';
-      });
-      return;
-    }
-
-    final OcrResult result = OcrResult(
-      rawText: payload,
-      amounts: parsed.amount == null
-          ? const <double>[]
-          : <double>[parsed.amount!],
-      orderNumbers: parsed.orderNumber == null
-          ? const <String>[]
-          : <String>[parsed.orderNumber!],
-    );
-
-    if (_currentStep == ScanStep.price) {
-      _handlePriceStepResult(result);
-    } else {
-      _handleOrderNumberStepResult(result);
-    }
-  }
-
-  /// اختيار أفضل باركود من اللقطة: الأقرب لمركز الإطار ثم الأغنى بالأرقام.
-  Barcode? _pickLiveBarcode(BarcodeCapture capture) {
-    Barcode? best;
-    int bestScore = -1;
-    final double centerX = capture.size.width / 2;
-    final double centerY = capture.size.height / 2;
-
-    for (final Barcode barcode in capture.barcodes) {
-      final String? payload = barcode.rawValue ?? barcode.displayValue;
-      if (payload == null || payload.trim().isEmpty) {
-        continue;
-      }
-
-      int score = 0;
-
-      if (barcode.corners.isNotEmpty && capture.size.width > 0) {
-        double sumX = 0;
-        double sumY = 0;
-        for (final Offset corner in barcode.corners) {
-          sumX += corner.dx;
-          sumY += corner.dy;
-        }
-        final double dx = (sumX / barcode.corners.length) - centerX;
-        final double dy = (sumY / barcode.corners.length) - centerY;
-        final double distance = math.sqrt((dx * dx) + (dy * dy));
-        if (distance < capture.size.width / 4) {
-          score += 20;
-        }
-      }
-
-      // الحمولة الرقمية أرجح أن تكون رقم طلب أو مبلغاً.
-      if (RegExp(r'^\d+$').hasMatch(payload.trim())) {
-        score += 10;
-      }
-      if (payload.length > 64) {
-        score -= 5;
-      }
-
-      if (score > bestScore) {
-        bestScore = score;
-        best = barcode;
-      }
-    }
-
-    return best;
-  }
-
-  /// تحويل أخطاء الماسح المباشر (`mobile_scanner`) إلى رسالة عربية وأزرار إصلاح.
-  ///
-  /// تُفحص أرقام الأخطاء الرسمية، ويُفحص نص التفاصيل أيضاً لأن تنفيذ الويب
-  /// يُرسل بعض الحالات (تعذّر تحميل محرّك القراءة مثلاً) كخطأ عام.
-  _CameraFailure _describeLiveScanFailure(Object error) {
-    final bool insecure = _environment?.isSecureContext == false;
-
-    if (error is! MobileScannerException) {
-      return const _CameraFailure(
-        kind: CameraFailureKind.unknown,
-        message: 'تعذّر تشغيل الماسح التلقائي. أعد المحاولة أو استخدم '
-            '«الإدخال اليدوي».',
-      );
-    }
-
-    final String details = error.errorDetails?.message ?? '';
-
-    switch (error.errorCode) {
-      case MobileScannerErrorCode.permissionDenied:
-        return _CameraFailure(
-          kind: CameraFailureKind.permission,
-          permanentlyDenied: true,
-          message: 'لم يُسمح باستخدام الكاميرا لهذا الموقع.\n\n'
-              'اضغط «كيف أسمح بالكاميرا؟» لمعرفة طريقة التفعيل من إعدادات '
-              'المتصفح، ثم أعد المحاولة.',
-        );
-      case MobileScannerErrorCode.unsupported:
-        return _CameraFailure(
-          kind: insecure
-              ? CameraFailureKind.insecureContext
-              : CameraFailureKind.unsupported,
-          message: insecure
-              ? 'المتصفح يمنع فتح الكاميرا لأن الصفحة غير مشفّرة (http).\n\n'
-                    'افتح رابط https:// ثم أعد المحاولة.'
-              : 'هذا المتصفح لا يدعم فتح الكاميرا، أو لا توجد كاميرا متاحة.',
-        );
-      case MobileScannerErrorCode.controllerNotAttached:
-      case MobileScannerErrorCode.controllerInitializing:
-        return const _CameraFailure(
-          kind: CameraFailureKind.busy,
-          message: 'الكاميرا قيد التهيئة. اضغط «إعادة المحاولة» بعد لحظة.',
-        );
-      case MobileScannerErrorCode.controllerAlreadyInitialized:
-        return const _CameraFailure(
-          kind: CameraFailureKind.busy,
-          message: 'الماسح يعمل بالفعل. وجّه الكاميرا نحو الباركود داخل المربع.',
-        );
-      case MobileScannerErrorCode.controllerDisposed:
-      case MobileScannerErrorCode.controllerUninitialized:
-        return const _CameraFailure(
-          kind: CameraFailureKind.unknown,
-          message: 'انتهت جلسة الكاميرا. أعد المحاولة لبدء جلسة جديدة.',
-        );
-      case MobileScannerErrorCode.genericError:
-        if (details.contains('BarcodeReader')) {
-          return const _CameraFailure(
-            kind: CameraFailureKind.unsupported,
-            message:
-                'تعذّر تحميل محرّك قراءة الباركود (مشكلة في الشبكة).\n\n'
-                'تحقّق من الاتصال بالإنترنت ثم أعد المحاولة، أو أدخل السعر '
-                'ورقم الطلب يدوياً.',
-          );
-        }
-        if (details.contains('NotAllowedError')) {
-          return _CameraFailure(
-            kind: CameraFailureKind.permission,
-            permanentlyDenied: true,
-            message: 'منع المتصفح استخدام الكاميرا.\n\n'
-                'فعّل الإذن من إعدادات الموقع ثم أعد المحاولة.',
-          );
-        }
-        if (details.contains('NotFoundError') ||
-            details.contains('NotSupportedError')) {
-          return const _CameraFailure(
-            kind: CameraFailureKind.notFound,
-            message: 'لم يتم العثور على كاميرا مطابقة في هذا الجهاز.',
-          );
-        }
-        return _CameraFailure(
-          kind: CameraFailureKind.unknown,
-          message: details.isEmpty
-              ? 'تعذّر تشغيل الماسح التلقائي. أعد المحاولة أو استخدم '
-                    '«الإدخال اليدوي».'
-              : 'تعذّر تشغيل الماسح التلقائي: ${_shorten(details)}',
-        );
-    }
-  }
-
-  /// تقصير نص الخطأ التقني ليظهر بشكل مرتب في الواجهة.
-  static String _shorten(String value) {
-    final String trimmed = value.trim();
-    if (trimmed.length <= 160) {
-      return trimmed;
-    }
-    return '${trimmed.substring(0, 157)}…';
-  }
-
   /// خطوات السماح بالكاميرا لكل متصفح (تُعرض في نافذة المساعدة).
   static const String _permissionHelpText =
       'متصفح Chrome / Edge (أندرويد أو كمبيوتر):\n'
@@ -1131,7 +619,7 @@ class _CameraScanScreenState extends State<CameraScanScreen>
               key: const ValueKey<String>('camera-help-retry-button'),
               onPressed: () {
                 Navigator.of(dialogContext).pop();
-                _startCamera(fromUserGesture: true);
+                _retrySnapshot();
               },
               icon: const Icon(Icons.refresh, size: 18),
               label: const Text('إعادة المحاولة'),
@@ -1206,19 +694,6 @@ class _CameraScanScreenState extends State<CameraScanScreen>
 
   /// تنفيذ الالتقاط ومعالجة النص بحسب الخطوة الحالية.
   Future<void> _captureAndRecognize() async {
-    // على الويب: لا توجد قراءة نصوص تلقائية (google_mlkit لا يدعم Flutter Web)،
-    // فنوضح ذلك بوضوح بدل إظهار «لم يتم العثور على أرقام» وهو غير صحيح.
-    if (!OcrService.isSupported) {
-      if (mounted) {
-        setState(() {
-          _notice =
-              'قراءة الأرقام تلقائياً غير متاحة في المتصفح. استخدم «الإدخال اليدوي» '
-              'أو افتح التطبيق على الجوال لقراءة الأسعار ورقم الطلب بالكاميرا.';
-        });
-      }
-      return;
-    }
-
     final CameraController? controller = _controller;
     if (controller == null ||
         !controller.value.isInitialized ||
@@ -1450,6 +925,253 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     );
   }
 
+  // ─── الويب: واجهة الالتقاط (صورة ثابتة داخل إطار التحديد) ──────────────
+
+  /// واجهة المسح على الويب: صورة ثابتة داخل إطار التحديد + أزرار الالتقاط.
+  Widget _buildSnapshotView() {
+    final Uint8List? bytes = _snapshotBytes;
+    final String? notice = _notice;
+    final bool isOrderNumberStep = _currentStep == ScanStep.orderNumber;
+
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        // نحفظ أبعاد منطقة المعاينة لحساب إطار المسح داخل الصورة الملتقطة.
+        _previewSize = constraints.biggest;
+
+        return Stack(
+          fit: StackFit.expand,
+          children: <Widget>[
+            // 1) الصورة الملتقطة (أو مكان فارغ يوضح الخطوة المطلوبة).
+            _buildSnapshotPreview(bytes),
+
+            // 2) إطار التحديد نفسه (نفس شكل الشاشة الحالية).
+            ScanBoxOverlay(
+              scanBoxSize: scanBoxSize,
+              instructions: isOrderNumberStep
+                  ? 'التقط صورة لرقم الطلب أو الباركود'
+                  : 'التقط صورة لسعر الطلب',
+            ),
+
+            // 3) شريط خطوات الالتقاط المتتابع.
+            Positioned(
+              top: 14,
+              left: 16,
+              right: 16,
+              child: _buildStepperHeader(),
+            ),
+
+            // 4) علامة النجاح عند قراءة قيمة.
+            if (_stepSucceeded)
+              ScanSuccessOverlay(
+                checkmarkKey: successKey,
+                message: _successMessage,
+              ),
+
+            // 5) التنبيهات النصية.
+            if (notice != null && !_stepSucceeded)
+              Positioned(
+                left: 20,
+                right: 20,
+                bottom: isOrderNumberStep ? 258 : 206,
+                child: _ScanHint(text: notice, isWarning: true),
+              ),
+
+            // 6) مؤشر القراءة أثناء تحليل الصورة.
+            if (_isProcessing)
+              const Positioned(
+                top: 66,
+                left: 0,
+                right: 0,
+                child: Center(child: _SnapshotReadingChip()),
+              ),
+
+            // 7) أزرار الالتقاط + الإدخال اليدوي.
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 24,
+              child: _buildSnapshotControls(),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// معاينة الصورة الملتقطة (أو حالة فارغة واضحة قبل الالتقاط).
+  Widget _buildSnapshotPreview(Uint8List? bytes) {
+    if (bytes == null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 30),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              const Icon(
+                Icons.photo_camera_outlined,
+                size: 54,
+                color: Colors.white54,
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'لا توجد صورة بعد',
+                style: Theme.of(
+                  context,
+                ).textTheme.titleMedium?.copyWith(color: Colors.white70),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'اضغط «التقاط صورة» لفتح كاميرا جهازك وتصوير السعر أو رقم '
+                'الطلب، ثم تُقرأ الأرقام تلقائياً.',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Colors.white54,
+                  height: 1.6,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return ColoredBox(
+      color: Colors.black,
+      child: Image.memory(
+        bytes,
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+        filterQuality: FilterQuality.medium,
+      ),
+    );
+  }
+
+  /// أزرار شاشة الالتقاط: كاميرا الجهاز + الصور + الإدخال اليدوي (بارز).
+  Widget _buildSnapshotControls() {
+    final bool isOrderNumberStep = _currentStep == ScanStep.orderNumber;
+    final bool busy = _isReadingSnapshot || _isProcessing;
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        // في خطوة رقم الطلب: إعادة مسح السعر + تخطي والاعتماد.
+        if (isOrderNumberStep) ...<Widget>[
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: <Widget>[
+                TextButton.icon(
+                  onPressed: _rescanPrice,
+                  style: TextButton.styleFrom(
+                    foregroundColor: Colors.white70,
+                    backgroundColor: Colors.black45,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 6,
+                    ),
+                  ),
+                  icon: const Icon(Icons.undo_rounded, size: 16),
+                  label: const Text(
+                    'إعادة مسح السعر',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ),
+                FilledButton.icon(
+                  key: const ValueKey<String>('skip-order-number-button'),
+                  onPressed: () => _finishFlow(),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: AppColors.primary,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 8,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  icon: const Icon(Icons.check_rounded, size: 18),
+                  label: const Text(
+                    'تخطي والاعتماد الآن',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+        ],
+
+        // زرّا الالتقاط: كاميرا الجهاز + اختيار صورة محفوظة.
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Row(
+            children: <Widget>[
+              Expanded(
+                child: FilledButton.icon(
+                  key: const ValueKey<String>('snapshot-camera-button'),
+                  onPressed: busy ? null : () => _pickSnapshot(fromCamera: true),
+                  icon: const Icon(Icons.photo_camera_rounded, size: 20),
+                  label: const Text('التقاط صورة'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: AppColors.primary,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  key: const ValueKey<String>('snapshot-gallery-button'),
+                  onPressed: busy ? null : () => _pickSnapshot(fromCamera: false),
+                  icon: const Icon(Icons.photo_library_outlined, size: 20),
+                  label: const Text('من الصور'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    side: const BorderSide(color: Colors.white54),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+
+        const SizedBox(height: 10),
+
+        // الإدخال اليدوي: خيار بديل بارز دائماً في أسفل الشاشة.
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              key: const ValueKey<String>('camera-manual-entry-button'),
+              onPressed: _isProcessing ? null : _exitWithManualEntry,
+              icon: const Icon(Icons.keyboard_alt_outlined, size: 18),
+              label: const Text('الإدخال اليدوي (السعر ورقم الطلب)'),
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.white,
+                foregroundColor: Colors.black87,
+                padding: const EdgeInsets.symmetric(vertical: 13),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   /// مؤشر تحميل موحّد أثناء تهيئة الكاميرا.
   Widget _buildLoadingIndicator() {
     final TextStyle? style = Theme.of(
@@ -1476,6 +1198,283 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     );
   }
 
+  // ─── الويب: التقاط صورة ثابتة وقراءة الأرقام منها ─────────────────────
+
+  /// فتح **كاميرا الجهاز** لالتقاط صورة، أو اختيار صورة من ملفات/معرض الجهاز.
+  ///
+  /// على الويب يُنفَّذ هذا عبر عنصر إدخال ملفات مخصّص (`capture` للكاميرا)
+  /// يوفّره المتصفح: الكاميرا تُدار بواسطة نظام الجهاز نفسه، ولا نفتح أي بث
+  /// فيديو مباشر داخل الصفحة، فلا شاشة سوداء ولا تعليق.
+  Future<void> _pickSnapshot({required bool fromCamera}) async {
+    if (_isReadingSnapshot) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isReadingSnapshot = true;
+        _error = null;
+        _failureKind = CameraFailureKind.none;
+        _notice = fromCamera
+            ? 'التقط صورة واضحة للفاتورة، وسيُقرأ الرقم تلقائياً.'
+            : 'اختر صورة واضحة لسعر الطلب أو رقم الطلب.';
+      });
+    }
+
+    try {
+      final XFile? file = await _imagePicker.pickImage(
+        source: fromCamera ? ImageSource.camera : ImageSource.gallery,
+        imageQuality: 95,
+        maxWidth: 2400,
+      );
+
+      if (file == null) {
+        // ألغى المستخدم الالتقاط — ليست حالة خطأ.
+        if (mounted) {
+          setState(() => _notice = 'لم يتم اختيار صورة. يمكنك الإدخال يدوياً.');
+        }
+        return;
+      }
+
+      final Uint8List bytes = await file.readAsBytes();
+      final ({int width, int height})? dimensions =
+          ScanImagePreprocessor.dimensionsOf(bytes);
+
+      if (bytes.isEmpty || dimensions == null) {
+        _failSnapshot(
+          'تعذّر قراءة الصورة الملتقطة (ملف غير صالح).\n\n'
+          'أعد الالتقاط أو أدخل السعر ورقم الطلب يدوياً.',
+        );
+        return;
+      }
+
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _snapshotBytes = bytes;
+        _snapshotSize = Size(
+          dimensions.width.toDouble(),
+          dimensions.height.toDouble(),
+        );
+      });
+
+      await _readSnapshotDigits(bytes);
+    } on PlatformException catch (error) {
+      _failSnapshot(_snapshotFailureMessage(error));
+    } catch (_) {
+      _failSnapshot(
+        'تعذّر فتح الكاميرا أو الوصول إلى الصورة.\n\n'
+        'جرّب «من الصور» لاختيار صورة محفوظة، أو أدخل القيم يدوياً.',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isReadingSnapshot = false);
+      }
+    }
+  }
+
+  /// قراءة الأرقام من الصورة: الباركود أولاً (أسرع وأدق) ثم النص المطبوع.
+  Future<void> _readSnapshotDigits(Uint8List bytes) async {
+    if (mounted) {
+      setState(() {
+        _isProcessing = true;
+        _notice = 'جاري قراءة الأرقام من الصورة…';
+      });
+    }
+
+    try {
+      // 1) تجهيز الصورة: قصّ منطقة إطار المسح + تكبير + رفع تباين.
+      final Rect? region = _scanRegionInImage(_snapshotSize, _previewSize);
+      final PreparedScanImage? prepared = ScanImagePreprocessor.prepare(
+        bytes,
+        region: region,
+      );
+      final Uint8List readBytes = prepared?.bytes ?? bytes;
+
+      // 2) الباركود/QR: من الصورة الكاملة أولاً ثم من منطقة الإطار.
+      final List<String> payloads = <String>[];
+      for (final Uint8List candidate in <Uint8List>[bytes, readBytes]) {
+        final WebImageBarcodeResult result = await readBarcodesFromImage(
+          candidate,
+        );
+        if (result.status == WebImageBarcodeStatus.ok &&
+            result.payloads.isNotEmpty) {
+          payloads.addAll(result.payloads);
+          break;
+        }
+      }
+
+      // 3) النص المطبوع داخل منطقة الإطار (لقراءة السعر المكتوب).
+      final WebTextOcrResult ocr = await recognizeTextFromImage(readBytes);
+
+      if (!mounted) {
+        return;
+      }
+
+      // 4) تحويل ما قُرئ إلى سعر و/أو رقم طلب بحسب الخطوة الحالية.
+      final LiveScanTarget target = _currentStep == ScanStep.price
+          ? LiveScanTarget.price
+          : LiveScanTarget.orderNumber;
+
+      LiveScanPayload? parsed;
+      for (final String payload in payloads) {
+        final LiveScanPayload candidate = LiveScanPayload.parse(
+          payload,
+          target: target,
+        );
+        if (!candidate.isEmpty) {
+          parsed = candidate;
+          break;
+        }
+      }
+      if (parsed == null && (ocr.text ?? '').trim().isNotEmpty) {
+        final LiveScanPayload fromText = LiveScanPayload.parse(
+          ocr.text,
+          target: target,
+        );
+        if (!fromText.isEmpty) {
+          parsed = fromText;
+        }
+      }
+
+      if (parsed == null || parsed.isEmpty) {
+        setState(() {
+          _isProcessing = false;
+          _notice = _emptyReadNotice(ocr);
+        });
+        return;
+      }
+
+      final OcrResult result = OcrResult(
+        rawText: payloads.isNotEmpty
+            ? payloads.join(' ')
+            : (ocr.text ?? '').trim(),
+        amounts: parsed.amount == null
+            ? const <double>[]
+            : <double>[parsed.amount!],
+        orderNumbers: parsed.orderNumber == null
+            ? const <String>[]
+            : <String>[parsed.orderNumber!],
+      );
+
+      setState(() => _isProcessing = false);
+
+      if (_currentStep == ScanStep.price) {
+        _handlePriceStepResult(result);
+      } else {
+        _handleOrderNumberStepResult(result);
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _isProcessing = false;
+          _notice = 'تعذّرت قراءة الصورة. جرّب صورة أوضح أو أدخل القيم يدوياً.';
+        });
+      }
+    }
+  }
+
+  /// منطقة إطار المسح داخل الصورة الملتقطة (بالبكسل).
+  ///
+  /// تُستخدم نفس هندسة `BoxFit.cover` المتمركزة المستخدمة في المعاينة، حتى
+  /// تُقرأ الأرقام من داخل الإطار فقط.
+  Rect? _scanRegionInImage(Size? imageSize, Size? previewSize) {
+    if (imageSize == null || previewSize == null) {
+      return null;
+    }
+    if (previewSize.width <= 0 || previewSize.height <= 0) {
+      return null;
+    }
+
+    final Rect scanBox = Rect.fromCenter(
+      center: Offset(previewSize.width / 2, previewSize.height / 2),
+      width: scanBoxSize.width,
+      height: scanBoxSize.height,
+    );
+
+    return ScanGeometry.mapToImage(
+      scanBox: scanBox,
+      viewSize: previewSize,
+      imageSize: imageSize,
+    );
+  }
+
+  /// إعادة المحاولة: يقرأ الصورة الحالية، أو يفتح الكاميرا إن لم توجد صورة.
+  Future<void> _retrySnapshot() async {
+    final Uint8List? bytes = _snapshotBytes;
+    if (bytes == null || bytes.isEmpty) {
+      await _pickSnapshot(fromCamera: true);
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _error = null;
+        _failureKind = CameraFailureKind.none;
+      });
+    }
+    await _readSnapshotDigits(bytes);
+  }
+
+  /// البدء من جديد على الويب: مسح الصورة الحالية والاستعداد لالتقاط أخرى.
+  void _resetSnapshot() {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _snapshotBytes = null;
+      _snapshotSize = null;
+      _isProcessing = false;
+      _isReadingSnapshot = false;
+      _error = null;
+      _failureKind = CameraFailureKind.none;
+      _notice = 'اضغط «التقاط صورة» لفتح كاميرا جهازك.';
+    });
+  }
+
+  /// رسالة واضحة عندما لا تُقرأ أي قيمة من الصورة.
+  String _emptyReadNotice(WebTextOcrResult ocr) {
+    switch (ocr.status) {
+      case WebTextOcrStatus.offline:
+        return 'تعذّر تحميل محرّك قراءة النص (تحقّق من الاتصال بالإنترنت).\n\n'
+            'أدخل السعر ورقم الطلب يدوياً.';
+      case WebTextOcrStatus.failed:
+        return 'لم يُقرأ أي رقم واضح من الصورة.\n\n'
+            'جرّب صورة أقرب وأوضح، أو أدخل القيم يدوياً.';
+      case WebTextOcrStatus.ok:
+        return 'لم يُعثر على سعر أو رقم طلب واضح داخل الإطار.\n\n'
+            'وجّه الصورة نحو الرقم بدقة، أو أدخل القيم يدوياً.';
+      case WebTextOcrStatus.notApplicable:
+        return 'أدخل السعر ورقم الطلب يدوياً.';
+    }
+  }
+
+  /// رسالة عربية لأخطاء منتقي الصور (رفض إذن الكاميرا مثلاً).
+  String _snapshotFailureMessage(PlatformException error) {
+    final String code = error.code.toLowerCase();
+    if (code.contains('denied') || code.contains('permission')) {
+      return 'لم يُسمح باستخدام الكاميرا أو الصور.\n\n'
+          'امنح الإذن من إعدادات المتصفح/الجهاز ثم أعد المحاولة، '
+          'أو أدخل السعر ورقم الطلب يدوياً.';
+    }
+    return 'تعذّر فتح الكاميرا أو اختيار الصورة (${error.code}).\n\n'
+        'أعد المحاولة أو أدخل القيم يدوياً.';
+  }
+
+  /// عرض فشل الالتقاط/المعالجة مع إبقاء الإدخال اليدوي متاحاً.
+  void _failSnapshot(String message) {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _isProcessing = false;
+      _isReadingSnapshot = false;
+      _failureKind = CameraFailureKind.unknown;
+      _error = message;
+    });
+  }
+
   /// بطاقة الفشل: رسالة واضحة + أزرار الإصلاح + بديل الإدخال اليدوي.
   Widget _buildFailureCard(String error) {
     final bool isWebPermissionIssue =
@@ -1490,7 +1489,7 @@ class _CameraScanScreenState extends State<CameraScanScreen>
           : Icons.no_photography_outlined,
       message: error,
       primaryLabel: 'إعادة المحاولة',
-      onPrimary: () => _startCamera(fromUserGesture: true),
+      onPrimary: _retrySnapshot,
       secondaryLabel: isWebPermissionIssue
           ? 'كيف أسمح بالكاميرا؟'
           : (canOpenSettings ? 'فتح الإعدادات' : null),
@@ -1508,23 +1507,14 @@ class _CameraScanScreenState extends State<CameraScanScreen>
       return _buildFailureCard(error);
     }
 
-    // ─── الويب: المسح التلقائي المباشر (mobile_scanner) ─────────────────
-    // نُبقي ودجت الماسح في الشجرة حتى يبقى مرتبطاً بوحدة التحكم، ولهذا لا
-    // نستبدله بمؤشر تحميل أثناء التهيئة (وإلا فشل التشغيل بخطأ عدم الارتباط).
+    // ─── الويب: مسار الصورة الثابتة (Snapshot) — بلا أي بث فيديو مباشر ──
     if (kIsWeb) {
-      if (_awaitingUserGesture && _liveScanner == null) {
-        return _buildWebStartCard();
-      }
-      return _buildLiveScannerView();
+      return _buildSnapshotView();
     }
 
     // ─── الأجهزة الأصلية: الكاميرا + قراءة الأرقام (OCR) ────────────────
     if (_isInitializing) {
       return _buildLoadingIndicator();
-    }
-
-    if (_awaitingUserGesture) {
-      return _buildWebStartCard();
     }
 
     final CameraController? controller = _controller;
@@ -1582,259 +1572,6 @@ class _CameraScanScreenState extends State<CameraScanScreen>
       ],
     );
   }
-
-  /// واجهة المسح التلقائي المباشر على الويب.
-  ///
-  /// تُحافظ على نفس شكل الشاشة السابقة: معاينة الكاميرا + إطار التحديد +
-  /// شريط الخطوات + علامة النجاح + الأزرار السفلية، مع قراءة تلقائية للباركود
-  /// داخل الإطار فقط.
-  Widget _buildLiveScannerView() {
-    final MobileScannerController? scanner = _liveScanner;
-    if (scanner == null) {
-      return _buildLoadingIndicator();
-    }
-
-    final String? notice = _notice;
-    final bool isOrderNumberStep = _currentStep == ScanStep.orderNumber;
-
-    return Stack(
-      fit: StackFit.expand,
-      children: <Widget>[
-        _buildLiveScannerWidget(scanner),
-
-        // إطار التحديد والتعتيم مع التعليمات (نفس الشكل الحالي).
-        ScanBoxOverlay(
-          scanBoxSize: scanBoxSize,
-          instructions: isOrderNumberStep
-              ? 'ضع رقم الطلب أو الباركود داخل المربع'
-              : 'ضع سعر الطلب أو الباركود داخل المربع',
-        ),
-
-        // شريط الخطوات المتتابعة في الأعلى.
-        Positioned(
-          top: 14,
-          left: 16,
-          right: 16,
-          child: _buildStepperHeader(),
-        ),
-
-        // علامة النجاح الخضراء عند قراءة قيمة.
-        if (_stepSucceeded)
-          ScanSuccessOverlay(
-            checkmarkKey: successKey,
-            message: _successMessage,
-          ),
-
-        // التنبيهات النصية (لم تُقرأ قيمة / باركود بلا رقم...).
-        if (notice != null && !_stepSucceeded)
-          Positioned(
-            left: 20,
-            right: 20,
-            bottom: isOrderNumberStep ? 200 : 150,
-            child: _ScanHint(text: notice, isWarning: true),
-          ),
-
-        // حالة المسح التلقائي (يعمل / متوقف).
-        Positioned(
-          left: 0,
-          right: 0,
-          bottom: isOrderNumberStep ? 156 : 104,
-          child: _buildLiveStatusRow(),
-        ),
-
-        // شريط الأزرار أسفل الشاشة.
-        Positioned(
-          left: 0,
-          right: 0,
-          bottom: 24,
-          child: _buildBottomControls(),
-        ),
-
-        // بطاقة البدء تظهر فوق المعاينة عند انتظار نقرة المستخدم.
-        if (_awaitingUserGesture)
-          ColoredBox(
-            color: Colors.black.withValues(alpha: 0.94),
-            child: _buildWebStartCard(),
-          ),
-      ],
-    );
-  }
-
-  /// ودجت الماسح المباشر (المعاينة + التحليل التلقائي داخل إطار التحديد).
-  Widget _buildLiveScannerWidget(MobileScannerController scanner) {
-    return LayoutBuilder(
-      builder: (BuildContext context, BoxConstraints constraints) {
-        return MobileScanner(
-          controller: scanner,
-          fit: BoxFit.cover,
-          // إطار التحليل = إطار التحديد المرئي نفسه، فلا يُقرأ خارج المربع.
-          scanWindow: _liveScanWindowRect(constraints.biggest),
-          placeholderBuilder: (BuildContext context) =>
-              const ColoredBox(color: Colors.black),
-          errorBuilder: (
-            BuildContext context,
-            MobileScannerException error,
-          ) {
-            // خطأ بعد التشغيل: نعرض بطاقة الفشل مع أزرار الإصلاح.
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted && _error == null) {
-                _applyFailure(_describeLiveScanFailure(error));
-              }
-            });
-            return const ColoredBox(color: Colors.black);
-          },
-          onDetect: _onLiveBarcodeDetected,
-          onDetectError: (Object error, StackTrace stackTrace) {
-            // خطأ إطار واحد لا يوقف المسح: تنبيه خفيف فقط.
-            if (mounted && _error == null) {
-              setState(() {
-                _notice =
-                    'تعذّرت قراءة أحد الإطارات. استمر في توجيه الباركود داخل المربع.';
-              });
-            }
-          },
-        );
-      },
-    );
-  }
-
-  /// مستطيل إطار التحليل داخل معاينة الماسح (نفس مقاس إطار التحديد، متمركز).
-  static Rect _liveScanWindowRect(Size size) {
-    return Rect.fromCenter(
-      center: Offset(size.width / 2, size.height / 2),
-      width: scanBoxSize.width,
-      height: scanBoxSize.height,
-    );
-  }
-
-  /// سطر يوضح حالة المسح التلقائي على الويب.
-  Widget _buildLiveStatusRow() {
-    final bool running = _liveScannerRunning;
-
-    return Center(
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.55),
-          borderRadius: BorderRadius.circular(30),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            Icon(
-              running
-                  ? Icons.qr_code_scanner_rounded
-                  : Icons.pause_circle_outline,
-              size: 16,
-              color: running ? Colors.greenAccent : Colors.white70,
-            ),
-            const SizedBox(width: 6),
-            Text(
-              running
-                  ? 'المسح التلقائي يعمل — اقرأ الباركود داخل المربع'
-                  : 'المسح التلقائي متوقف — اضغط إعادة التشغيل',
-              style: const TextStyle(color: Colors.white, fontSize: 12),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// بطاقة تشغيل الكاميرا على الويب (تنتظر نقرة صريحة من المستخدم).
-  ///
-  /// المتصفحات — وعلى رأسها Safari في iOS — ترفض تشغيل الكاميرا بدون تفاعل
-  /// مباشر، فبدل معاينة سوداء صامتة نعرض زراً واضحاً مع خيارات بديلة.
-  Widget _buildWebStartCard() {
-    final String? notice = _notice;
-    final TextTheme text = Theme.of(context).textTheme;
-
-    return Center(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(26),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            Container(
-              width: 104,
-              height: 104,
-              decoration: BoxDecoration(
-                color: AppColors.surface,
-                borderRadius: BorderRadius.circular(24),
-                border: Border.all(
-                  color: AppColors.primary.withValues(alpha: 0.35),
-                  width: 2,
-                ),
-              ),
-              child: const Icon(
-                Icons.photo_camera_front_outlined,
-                size: 52,
-                color: AppColors.primary,
-              ),
-            ),
-            const SizedBox(height: 22),
-            const Text(
-              'تشغيل الكاميرا',
-              style: TextStyle(
-                color: AppColors.textPrimary,
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              'اضغط الزر أدناه للسماح بالكاميرا وتشغيل المعاينة.\n'
-              'متصفحات الجوال (Safari وChrome) لا تسمح بتشغيل الكاميرا تلقائياً، '
-              'لذلك يظهر طلب الإذن عند الضغط فقط.',
-              textAlign: TextAlign.center,
-              style: text.bodyMedium?.copyWith(
-                color: AppColors.textSecondary,
-                height: 1.7,
-              ),
-            ),
-            if (notice != null) ...<Widget>[
-              const SizedBox(height: 18),
-              _ScanHint(text: notice, isWarning: true),
-            ],
-            const SizedBox(height: 22),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                key: const ValueKey<String>('camera-permission-button'),
-                onPressed: () => _startCamera(fromUserGesture: true),
-                icon: const Icon(Icons.play_arrow_rounded),
-                label: const Text('السماح وتشغيل الكاميرا'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: AppColors.primary,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 4),
-            TextButton.icon(
-              key: const ValueKey<String>('camera-permission-help-button'),
-              onPressed: _showCameraPermissionHelp,
-              icon: const Icon(Icons.help_outline, size: 18),
-              label: const Text('كيف أسمح بالكاميرا؟'),
-              style: TextButton.styleFrom(foregroundColor: Colors.white70),
-            ),
-            TextButton.icon(
-              key: const ValueKey<String>('camera-manual-entry-button'),
-              onPressed: _exitWithManualEntry,
-              icon: const Icon(Icons.keyboard_alt_outlined, size: 18),
-              label: const Text('الإدخال اليدوي'),
-              style: TextButton.styleFrom(foregroundColor: Colors.white70),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
   /// شريط مؤشر الخطوات التتابعية في أعلى شاشة الكاميرا.
   Widget _buildStepperHeader() {
     final bool isPriceStep = _currentStep == ScanStep.price;
@@ -1948,30 +1685,6 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
-        // على الويب: قراءة الأرقام تلقائياً غير متاحة → نُظهر زر إدخال يدوي
-        // واضحاً فوق زر الالتقاط بدل ترك المستخدم ينتظر قراءة لن تحدث.
-        if (!OcrService.isSupported) ...<Widget>[
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
-            child: SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                key: const ValueKey<String>('camera-manual-entry-button'),
-                onPressed: _isProcessing ? null : _exitWithManualEntry,
-                icon: const Icon(Icons.keyboard_alt_outlined, size: 18),
-                label: const Text('إدخال السعر ورقم الطلب يدوياً'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: AppColors.primary,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
         // عند خطوة رقم الطلب: زر تخطي ورقم السعر المحفوظ
         if (isOrderNumberStep) ...<Widget>[
           Padding(
@@ -2007,14 +1720,12 @@ class _CameraScanScreenState extends State<CameraScanScreen>
           const SizedBox(height: 12),
         ],
 
-        // زر التصوير المركزي مع حلقة التحميل — للأجهزة الأصلية فقط،
-        // لأن الويب يعتمد على المسح التلقائي المباشر + الإدخال اليدوي.
-        if (OcrService.isSupported)
-          _CaptureBar(
-            isProcessing: _isProcessing,
-            onCapture: _captureAndRecognize,
-            stepLabel: isOrderNumberStep ? 'التقاط رقم الطلب' : 'التقاط السعر',
-          ),
+        // زر التصوير المركزي مع حلقة التحميل (الأجهزة الأصلية).
+        _CaptureBar(
+          isProcessing: _isProcessing,
+          onCapture: _captureAndRecognize,
+          stepLabel: isOrderNumberStep ? 'التقاط رقم الطلب' : 'التقاط السعر',
+        ),
       ],
     );
   }
@@ -2191,6 +1902,40 @@ class _CaptureBar extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+/// مؤشر «جاري قراءة الأرقام» أعلى شاشة الالتقاط على الويب.
+class _SnapshotReadingChip extends StatelessWidget {
+  const _SnapshotReadingChip();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(30),
+      ),
+      child: const Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: Colors.white,
+            ),
+          ),
+          SizedBox(width: 10),
+          Text(
+            'جاري قراءة الأرقام…',
+            style: TextStyle(color: Colors.white, fontSize: 12),
+          ),
+        ],
+      ),
     );
   }
 }

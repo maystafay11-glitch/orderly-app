@@ -57,22 +57,27 @@ class OcrResult {
   bool get isEmpty => amounts.isEmpty && orderNumbers.isEmpty;
 }
 
-/// خدمة التعرف على النصوص والأرقام من الصور باستخدام Google ML Kit.
+/// خدمة التعرف على النصوص والأرقام من الصور.
 ///
 /// تُستخدم مع شاشة الكاميرا: تُقرأ الصورة، ثم تُستخرج الأرقام من النص
 /// لملء حقل سعر الطلب تلقائياً (ويبقى الإدخال اليدوي متاحاً دائماً).
 ///
-/// **على الويب**: جميع دوال OCR تُرجع [OcrResult.empty] فوراً —
-/// google_mlkit لا يدعم Flutter Web.
+/// **على الويب**: google_mlkit لا يدعم Flutter Web؛ وبدلاً منه يُستخدم
+/// `web_text_ocr.dart` (Tesseract.js من CDN عبر `recognizeTextFromImage`)
+/// كبديل متوافق تماماً لقراءة النصوص المطبوعة مباشرة من صورة ثابتة.
+/// وكل حالات الفشل (لا إنترنت، موقع يحجب الـ CDN، أو لا يوجد نص) معالَجة
+/// لتفادي توقف التطبيق؛ ويبقى **الإدخال اليدوي متاحاً دائماً** كخلفية
+/// منبهة صحيحة بدلاً من رسائل فشل مضللة.
 class OcrService {
   const OcrService._();
 
   /// هل تدعم هذه المنصة قراءة النصوص تلقائياً (OCR)؟
   ///
-  /// * Android/iOS/الكمبيوتر: `true` (عبر google_mlkit).
-  /// * الويب: `false` لأن google_mlkit لا يدعم Flutter Web؛ وفي هذه الحالة
-  ///   تُعرض في شاشة المسح رسالة صحيحة مع إدخال يدوي بدل رسائل فشل مضللة.
-  static const bool isSupported = !kIsWeb;
+  /// * Android / iOS / كمبيوتر: `true` (عبر google_mlkit).
+  /// * الويب: `true` — يُستخدم `web_text_ocr.dart` (Tesseract.js من CDN).
+  ///   إن لم يتوفر المحرك (offline / CDN محظور) تُعرض رسالة ملائمة
+  ///   مع إدخال يدوي بدلاً من إيقاف الشاشة.
+  static const bool isSupported = true;
 
   /// نمط الأرقام: `1500` أو `1,500` أو `1.500` أو `12.5`.
   static final RegExp _numberPattern = RegExp(r'\d+(?:[.,]\d+)*');

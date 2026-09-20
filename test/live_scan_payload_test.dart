@@ -137,6 +137,40 @@ void main() {
     });
   });
 
+  group('LiveScanPayload — نصوص مقروءة من صورة (OCR)', () {
+    test('يستخرج السعر الأكبر من نص فاتورة', () {
+      const String text =
+          'فاتورة رقم 7\nالمجموع: 250,000 د.ع\nالتوصيل: 5000';
+
+      final LiveScanPayload payload = LiveScanPayload.parse(
+        text,
+        target: LiveScanTarget.price,
+      );
+
+      expect(payload.amount, 250000);
+    });
+
+    test('يستخرج رقم الطلب من نص فيه تصنيف صريح', () {
+      const String text = 'رقم الطلب ١٢٣٤٥\nالسعر 15000';
+
+      final LiveScanPayload payload = LiveScanPayload.parse(
+        text,
+        target: LiveScanTarget.orderNumber,
+      );
+
+      expect(payload.orderNumber, '12345');
+    });
+
+    test('يرفض النص الذي لا يحتوي أي أرقام', () {
+      final LiveScanPayload payload = LiveScanPayload.parse(
+        'لا يوجد شيء هنا',
+        target: LiveScanTarget.price,
+      );
+
+      expect(payload.isEmpty, isTrue);
+    });
+  });
+
   group('LiveScanPayload — حالات عامة', () {
     test('الحمولة الفارغة أو بلا أرقام تُرجع نتيجة فارغة', () {
       expect(LiveScanPayload.parse(null).isEmpty, isTrue);

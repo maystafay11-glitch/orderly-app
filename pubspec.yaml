@@ -39,13 +39,20 @@ dependencies:
   google_mlkit_text_recognition: ^0.16.0
   google_mlkit_commons: ^0.12.0
   camera: ^0.12.0+2
-  # الماسح التلقائي المباشر (باركود/QR) — يدعم Android و iOS والويب (ZXing web).
-  mobile_scanner: ^7.4.2
   permission_handler: 12.0.3
   url_launcher: ^6.3.1
 
-  # واجهات المتصفح (DOM) — تُستخدم فقط على Flutter Web لفحص بيئة الكاميرا
-  # (السياق الآمن + حالة إذن الكاميرا) عبر lib/utils/camera_web_support.dart.
+  # الالتقاط بالصورة الثابتة (Snapshot) على الويب:
+  # يفتح كاميرا الجهاز أو معرض الصور عبر <input type="file"> — بدون أي بث
+  # فيديو مباشر، وبلا شاشة سوداء على Safari/Chrome.
+  image_picker: ^1.2.3
+
+  # معالجة الصورة الملتقطة (قصّ إطار المسح + تكبير + تباين) قبل القراءة،
+  # وهي مكتبة Dart خالصة تعمل على الويب والأجهزة الأصلية.
+  image: ^4.10.1
+
+  # واجهات المتصفح (DOM) — تُستخدم فقط على Flutter Web لقراءة الباركود من
+  # صورة ثابتة (BarcodeDetector) عبر lib/utils/web_barcode_image.dart.
   web: ^1.1.1
 
 dev_dependencies:
