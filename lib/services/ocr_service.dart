@@ -1,17 +1,13 @@
-import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui' show Rect, Size;
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 
 // ─── Conditional imports للمكتبات غير المتوافقة مع الويب ──────────────────
-// على الويب (kIsWeb=true): يُستخدم _ocr_stub.dart (واجهة فارغة)
 // على Android/iOS: يُستخدم _ocr_native.dart (google_mlkit الفعلي)
+// على الويب: يُستخدم _ocr_stub.dart (واجهة فارغة)
 import 'package:orderly_app/services/_ocr_stub.dart'
     // ignore: uri_does_not_exist
     if (dart.library.io) 'package:orderly_app/services/_ocr_native.dart';
-
-import 'package:orderly_app/utils/jpeg_info.dart';
 
 /// بكسل أعلى يُستخدم لتجنّب نتائج خافتة أو أرقام غير واقعية.
 const double maxReasonableAmount = 1000000;
@@ -97,19 +93,6 @@ class OcrService {
   static final RegExp _orderNumberHashSuffixPattern = RegExp(
     r'(\d{1,14})(?!\d)\s*#',
   );
-
-  /// قراءة أول [bytesLength] من الملف [imagePath] لاستخراج رأس JPEG.
-  ///
-  /// تُرجع `null` إذا لم يتم العثر على الملف أو كان فارغاً —
-  /// يُعامل ذلك `readRegion` كصورة بلا دوران (توافق الاختبارات).
-  /// **على الويب**: يُرجع `null` دائماً.
-  static Future<Uint8List?> _peekJpegBytes(
-    String imagePath, {
-    int bytesLength = 64 * 1024,
-  }) async {
-    if (kIsWeb) return null;
-    return OcrNativeHelper.peekJpegBytes(imagePath, bytesLength: bytesLength);
-  }
 
   /// قراءة صورة من المسار [imagePath] واستخراج المبالغ وأرقام الطلبات منها.
   ///

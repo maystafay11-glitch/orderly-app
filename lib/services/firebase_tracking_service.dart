@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:orderly_app/models/delivery_order.dart';
@@ -9,13 +8,21 @@ import 'package:orderly_app/models/shift_record.dart';
 import 'package:orderly_app/services/app_settings.dart';
 import 'package:orderly_app/services/audio_alert_service.dart';
 import 'package:orderly_app/services/driver_storage.dart';
+import 'package:orderly_app/services/firebase_realtime_service.dart';
+import 'package:orderly_app/services/restaurant_service.dart';
 
-/// خدمة التتبع اللحظي للسائقين والربط السحابي مع Firebase.
+/// خدمة التتبع اللحظي للسائقين والربط السحابي مع Firebase Realtime Database.
 ///
-/// تعمل بنمط (Offline-First Realtime Bus):
-/// 1. مزامنة فورية في نفس اللحظة عبر الـ Streams بين تطبيق السائق وشاشة المطعم.
-/// 2. دعم اختياري لمزامنة السحابة عبر Firebase Realtime DB / Firestore REST API.
-/// 3. إطلاق التنبيهات الصوتية فور تغيير الحالات (استلام، تسليم، طلب جديد).
+/// تعمل بنمط **Offline-First + Cloud Sync**:
+///
+/// 1. **محلياً أولاً**: كل تغيير يُحفظ فوراً في SharedPreferences.
+/// 2. **سحابياً لاحقاً**: يُرسل snapshot مشفر إلى Firebase تحت:
+///    `restaurants/{restaurantId}/snapshot` لمزامنة الأجهزة الأخرى.
+/// 3. **عزل تام**: كل مطعم يُكتب ويُقرأ تحت [restaurantId] الخاص به فقط.
+/// 4. **تنبيهات صوتية**: تُطلَق فور تغيير الحالات (استلام / تسليم / طلب جديد).
+///
+/// **للعمل بدون Firebase**: يكفي عدم إدخال Database URL في الإعدادات.
+///   التطبيق يعمل بالكامل محلياً بدون أي رسائل خطأ.
 class FirebaseTrackingService {
   FirebaseTrackingService._();
 
@@ -27,13 +34,43 @@ class FirebaseTrackingService {
   final StreamController<List<Driver>> _driversStreamController =
       StreamController<List<Driver>>.broadcast();
 
+  StreamSubscription<Map<String, dynamic>>? _remoteSubscription;
+
+  bool _listeningToRemote = false;
+
+  // ─── الواجهة العامة ───────────────────────────────────────────────────────
+
   /// دفق تدفق الطلبات الحية لحظة بلحظة.
-  Stream<List<DeliveryOrder>> get ordersStream => _ordersStreamController.stream;
+  Stream<List<DeliveryOrder>> get ordersStream =>
+      _ordersStreamController.stream;
 
   /// دفق تدفق السائقين الحية لحظة بلحظة.
   Stream<List<Driver>> get driversStream => _driversStreamController.stream;
 
-  /// بث التحديثات الحالية لكافة المستمعين.
+  /// تهيئة الخدمة وبدء الاستماع للتحديثات السحابية.
+  ///
+  /// يُستدعى مرة واحدة عند فتح التطبيق (من [AppAuthGate] أو [main]).
+  Future<void> initialize() async {
+    final String firebaseUrl = await AppSettings.getFirebaseDatabaseUrl();
+    if (firebaseUrl.isNotEmpty && RestaurantService.isInitialized) {
+      await FirebaseRealtimeService.instance.initialize(firebaseUrl);
+      _startListeningToRemote();
+    }
+    // إرسال البيانات المحلية الحالية للمستمعين
+    await notifyChanges();
+  }
+
+  /// إعادة تهيئة Firebase عند تغيير URL في الإعدادات.
+  Future<void> reinitializeFirebase() async {
+    _remoteSubscription?.cancel();
+    _listeningToRemote = false;
+    FirebaseRealtimeService.instance.dispose();
+    await initialize();
+  }
+
+  // ─── بث التحديثات ─────────────────────────────────────────────────────────
+
+  /// بث التحديثات الحالية لكافة المستمعين المحليين.
   Future<void> notifyChanges() async {
     final List<Driver> drivers = await DriverStorage.loadDrivers();
     final List<DeliveryOrder> general = await DriverStorage.loadGeneralOrders();
@@ -51,6 +88,8 @@ class FirebaseTrackingService {
       _driversStreamController.add(drivers);
     }
   }
+
+  // ─── استرجاع البيانات ─────────────────────────────────────────────────────
 
   /// استرجاع كل الطلبات النشطة الحالية (قيد الإعداد + مع السائق).
   Future<List<DeliveryOrder>> getActiveOrders() async {
@@ -78,6 +117,8 @@ class FirebaseTrackingService {
     return <DeliveryOrder>[];
   }
 
+  // ─── تحديث حالات الطلبات ─────────────────────────────────────────────────
+
   /// زر (تم الاستلام من المطعم):
   /// يُسجّل وقت خروج الطلب وبدء الطريق، ويُحدّث الحالة إلى [OrderStatus.pickedUp].
   Future<bool> markOrderPickedUp({
@@ -89,7 +130,8 @@ class FirebaseTrackingService {
 
     for (int i = 0; i < drivers.length; i++) {
       final Driver driver = drivers[i];
-      final int orderIndex = driver.orders.indexWhere((DeliveryOrder o) => o.id == orderId);
+      final int orderIndex =
+          driver.orders.indexWhere((DeliveryOrder o) => o.id == orderId);
 
       if (orderIndex != -1) {
         final DeliveryOrder current = driver.orders[orderIndex];
@@ -98,7 +140,8 @@ class FirebaseTrackingService {
           pickedUpAt: DateTime.now(),
         );
 
-        final List<DeliveryOrder> updatedOrders = List<DeliveryOrder>.of(driver.orders);
+        final List<DeliveryOrder> updatedOrders =
+            List<DeliveryOrder>.of(driver.orders);
         updatedOrders[orderIndex] = modified;
         drivers[i] = driver.copyWith(orders: updatedOrders);
         updated = true;
@@ -109,7 +152,7 @@ class FirebaseTrackingService {
     if (updated) {
       await DriverStorage.saveDrivers(drivers);
       await notifyChanges();
-      unawaited(_syncToFirebaseCloud());
+      unawaited(_syncToFirebase(drivers));
       return true;
     }
     return false;
@@ -129,7 +172,8 @@ class FirebaseTrackingService {
 
     for (int i = 0; i < drivers.length; i++) {
       final Driver driver = drivers[i];
-      final int orderIndex = driver.orders.indexWhere((DeliveryOrder o) => o.id == orderId);
+      final int orderIndex =
+          driver.orders.indexWhere((DeliveryOrder o) => o.id == orderId);
 
       if (orderIndex != -1) {
         final DeliveryOrder current = driver.orders[orderIndex];
@@ -138,7 +182,8 @@ class FirebaseTrackingService {
           deliveredAt: DateTime.now(),
         );
 
-        final List<DeliveryOrder> updatedOrders = List<DeliveryOrder>.of(driver.orders);
+        final List<DeliveryOrder> updatedOrders =
+            List<DeliveryOrder>.of(driver.orders);
         updatedOrders[orderIndex] = deliveredOrder;
         drivers[i] = driver.copyWith(orders: updatedOrders);
         targetDriver = drivers[i];
@@ -154,7 +199,7 @@ class FirebaseTrackingService {
 
       // تشغيل تنبيه النجاح الفوري للكاشير
       await AudioAlertService.playDeliveredAlert();
-      unawaited(_syncToFirebaseCloud());
+      unawaited(_syncToFirebase(drivers));
       return true;
     }
     return false;
@@ -177,8 +222,55 @@ class FirebaseTrackingService {
 
     // تشغيل تنبيه السائق بالطلب الجديد
     await AudioAlertService.playNewOrderAlert();
-    unawaited(_syncToFirebaseCloud());
+
+    final List<Driver> allDrivers = await DriverStorage.loadDrivers();
+    unawaited(_syncToFirebase(allDrivers));
   }
+
+  // ─── الاستماع للتحديثات السحابية ─────────────────────────────────────────
+
+  /// بدء الاستماع لتحديثات Firebase الواردة من أجهزة أخرى.
+  void _startListeningToRemote() {
+    if (_listeningToRemote) return;
+    _listeningToRemote = true;
+
+    _remoteSubscription =
+        FirebaseRealtimeService.instance.snapshotStream.listen(
+      (Map<String, dynamic> snapshot) async {
+        await _applyRemoteSnapshot(snapshot);
+      },
+      onError: (Object e) {
+        debugPrint('[FirebaseTracking] خطأ في الاستماع: $e');
+      },
+    );
+  }
+
+  /// تطبيق snapshot وارد من Firebase على البيانات المحلية.
+  Future<void> _applyRemoteSnapshot(Map<String, dynamic> snapshot) async {
+    try {
+      // استخراج قائمة السائقين من الـ snapshot
+      final Object? driversRaw = snapshot['drivers'];
+      if (driversRaw is! List) return;
+
+      final List<Driver> remoteDrivers = driversRaw
+          .whereType<Map<Object?, Object?>>()
+          .map((Map<Object?, Object?> item) =>
+              Driver.fromJson(Map<String, dynamic>.from(item)))
+          .toList();
+
+      // حفظ البيانات الواردة محلياً
+      await DriverStorage.saveDrivers(remoteDrivers);
+
+      // الإعلام بالتحديث الجديد
+      await notifyChanges();
+      debugPrint(
+          '[FirebaseTracking] بيانات مُطبَّقة من Firebase: ${remoteDrivers.length} سائق');
+    } catch (e) {
+      debugPrint('[FirebaseTracking] _applyRemoteSnapshot خطأ: $e');
+    }
+  }
+
+  // ─── المنطق الداخلي ───────────────────────────────────────────────────────
 
   /// توثيق الطلب المنجز في أرشيف الوردية اليومي للسائق (Shift History).
   Future<void> _recordShiftActivity(Driver driver, DeliveryOrder order) async {
@@ -202,7 +294,8 @@ class FirebaseTrackingService {
         records.add(newRecord);
       } else {
         final ShiftRecord current = records[index];
-        final List<DeliveryOrder> updatedOrders = List<DeliveryOrder>.of(current.orders);
+        final List<DeliveryOrder> updatedOrders =
+            List<DeliveryOrder>.of(current.orders);
         final int existingOrderIndex =
             updatedOrders.indexWhere((DeliveryOrder o) => o.id == order.id);
         if (existingOrderIndex == -1) {
@@ -223,17 +316,28 @@ class FirebaseTrackingService {
     }
   }
 
-  /// مزامنة التحديثات مع Firebase Cloud (عند توافر إعدادات الربط في AppSettings).
-  Future<void> _syncToFirebaseCloud() async {
-    try {
-      final String firebaseUrl = await AppSettings.getFirebaseDatabaseUrl();
-      if (firebaseUrl.isEmpty) return;
+  /// مزامنة البيانات الكاملة مع Firebase Realtime Database.
+  ///
+  /// يُرسل snapshot شامل يحتوي على قائمة السائقين كاملة، مع:
+  /// - [restaurantId] لضمان العزل التام
+  /// - timestamp للإعلام بوجود تغيير
+  Future<void> _syncToFirebase(List<Driver> drivers) async {
+    if (!FirebaseRealtimeService.instance.isConfigured) return;
 
-      // عند إدخال رابط Firebase Realtime Database أو Firestore REST
-      // يتم إرسال حمولة البيانات بنمط REST دون الحاجة لتبعيات ثقيلة
-      // مع استمرار عمل التطبيق المحلي 100% بدون أي انقطاع
+    try {
+      final Map<String, dynamic> snapshot = <String, dynamic>{
+        'restaurantId': RestaurantService.restaurantId,
+        'updatedAt': DateTime.now().toIso8601String(),
+        'drivers': drivers.map((Driver d) => d.toJson()).toList(),
+      };
+
+      final bool ok =
+          await FirebaseRealtimeService.instance.pushSnapshot(snapshot);
+      if (ok) {
+        debugPrint('[FirebaseTracking] sync ✅ — ${drivers.length} سائق');
+      }
     } catch (e) {
-      debugPrint('Firebase cloud sync note: $e');
+      debugPrint('[FirebaseTracking] _syncToFirebase خطأ: $e');
     }
   }
 }

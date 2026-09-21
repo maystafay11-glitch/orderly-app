@@ -31,6 +31,7 @@ class DeliveryOrder {
     this.pickedUpAt,
     this.deliveredAt,
     this.expectedDurationMinutes = 25,
+    this.proofImageData,
   })  : id = (id != null && id.isNotEmpty)
             ? id
             : 'ord_${(addedAt ?? DateTime.now()).microsecondsSinceEpoch}_${orderNumber.replaceAll(RegExp(r'\s+'), '')}',
@@ -58,6 +59,7 @@ class DeliveryOrder {
       pickedUpAt: json[keyPickedUpAt] != null ? _readDate(json[keyPickedUpAt]) : null,
       deliveredAt: json[keyDeliveredAt] != null ? _readDate(json[keyDeliveredAt]) : null,
       expectedDurationMinutes: _readInt(json[keyExpectedDurationMinutes], fallback: 25),
+      proofImageData: json[keyProofImageData]?.toString(),
     );
   }
 
@@ -73,6 +75,7 @@ class DeliveryOrder {
   static const String keyPickedUpAt = 'pickedUpAt';
   static const String keyDeliveredAt = 'deliveredAt';
   static const String keyExpectedDurationMinutes = 'expectedDurationMinutes';
+  static const String keyProofImageData = 'proofImageData';
 
   /// المعرف الفريد للطلب.
   final String id;
@@ -106,6 +109,9 @@ class DeliveryOrder {
 
   /// وقت الرحلة الطبيعي المتوقع بالدقائق (افتراضياً 25 دقيقة).
   final int expectedDurationMinutes;
+
+  /// صورة إثبات الطلب بصيغة Data URL مضغوطة (اختيارية، للويب والهاتف).
+  final String? proofImageData;
 
   /// رقم الطلب للعرض في الواجهة (أو «بدون رقم» إذا تُرك الحقل فارغاً).
   String get displayNumber => orderNumber.isEmpty ? 'بدون رقم' : orderNumber;
@@ -167,6 +173,7 @@ class DeliveryOrder {
     DateTime? pickedUpAt,
     DateTime? deliveredAt,
     int? expectedDurationMinutes,
+    String? proofImageData,
   }) =>
       DeliveryOrder(
         id: id ?? this.id,
@@ -181,6 +188,7 @@ class DeliveryOrder {
         deliveredAt: deliveredAt ?? this.deliveredAt,
         expectedDurationMinutes:
             expectedDurationMinutes ?? this.expectedDurationMinutes,
+        proofImageData: proofImageData ?? this.proofImageData,
       );
 
   /// تحويل الطلب إلى خريطة قابلة للتخزين بصيغة JSON أو الإرسال إلى Firebase.
@@ -196,6 +204,8 @@ class DeliveryOrder {
         if (pickedUpAt != null) keyPickedUpAt: pickedUpAt!.toIso8601String(),
         if (deliveredAt != null) keyDeliveredAt: deliveredAt!.toIso8601String(),
         keyExpectedDurationMinutes: expectedDurationMinutes,
+        if (proofImageData != null && proofImageData!.isNotEmpty)
+          keyProofImageData: proofImageData,
       };
 
   /// قراءة قيمة عشرية من JSON بأمان.

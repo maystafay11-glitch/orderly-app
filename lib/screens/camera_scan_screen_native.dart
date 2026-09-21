@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
@@ -126,7 +125,9 @@ class CameraScanScreen extends StatefulWidget {
 
 class _CameraScanScreenState extends State<CameraScanScreen>
     with WidgetsBindingObserver {
-  CameraController? _controller;
+      CameraController? _controller;
+    Timer? _webScanTimer;
+    bool _waitingForUserStart = true;
   bool _isInitializing = true;
   bool _isProcessing = false;
   bool _isTorchOn = false;
@@ -231,22 +232,19 @@ class _CameraScanScreenState extends State<CameraScanScreen>
   /// تهيئة الشاشة بحسب المنصة:
   ///
   /// * Android/iOS: طلب إذن الكاميرا ثم تشغيل الكاميرا وقراءة الأرقام (OCR).
-  /// * الويب: **لا بث فيديو مباشر إطلاقاً** — شاشة التقاط صورة (Snapshot)
-  ///   تعتمد على كاميرا الجهاز أو معرض الصور، فيسقط احتمال «الشاشة السوداء»
-  ///   من أساسه لأنه لا يوجد عنصر فيديو ننتظره.
+     /// * الويب: البث المباشر (Live Stream) — ننتظر نقرة مستخدم على
+  ///   «ابدأ المسح بالكاميرا» لتفعيد الكاميرا (يطلب الإذن من المتصفح).
   Future<void> _bootstrapCamera() async {
     if (!kIsWeb) {
       await _initializeCamera();
       return;
     }
 
+    // ✅ على الويب: لا شيء للفعله الآن — نعرض زر البدء للمستخدم
     if (mounted) {
       setState(() {
         _isInitializing = false;
-        _error = null;
-        _notice = null;
-        _failureKind = CameraFailureKind.none;
-        _permissionPermanentlyDenied = false;
+        _waitingForUserStart = true;
       });
     }
   }
@@ -928,6 +926,7 @@ class _CameraScanScreenState extends State<CameraScanScreen>
   // ─── الويب: واجهة الالتقاط (صورة ثابتة داخل إطار التحديد) ──────────────
 
   /// واجهة المسح على الويب: صورة ثابتة داخل إطار التحديد + أزرار الالتقاط.
+  // ignore: unused_element
   Widget _buildSnapshotView() {
     final Uint8List? bytes = _snapshotBytes;
     final String? notice = _notice;
@@ -1507,9 +1506,20 @@ class _CameraScanScreenState extends State<CameraScanScreen>
       return _buildFailureCard(error);
     }
 
-    // ─── الويب: مسار الصورة الثابتة (Snapshot) — بلا أي بث فيديو مباشر ──
+        // ─── الويب: البث المباشر (Live Stream) + زر التقاط سريع ────────────────
     if (kIsWeb) {
-      return _buildSnapshotView();
+      // الحالة 1: لم يُبدأ بعد → نعرض زر البدء
+      if (_waitingForUserStart && _controller == null) {
+        return _buildWebStartButton();
+      }
+
+      // الحالة 2: جاري التشغيل أو فشل → مؤشّر تحميل
+      if (_isInitializing || _controller == null) {
+        return _buildLoadingIndicator();
+      }
+
+      // الحالة 3: الكاميرا شغّالة → البث المباشر + إطار المسح
+      return _buildLiveWebPreview();
     }
 
     // ─── الأجهزة الأصلية: الكاميرا + قراءة الأرقام (OCR) ────────────────
@@ -1572,6 +1582,218 @@ class _CameraScanScreenState extends State<CameraScanScreen>
       ],
     );
   }
+
+  
+  // ─── الويب: بث مباشر + التحليل الفوري ──────────────────────────────────────
+
+  /// ✅ معالجة نتيجة باركود/نص: استخراج السعر ورقم الطلب
+  void _handleBarcode({required String raw}) {
+    final LiveScanPayload parsed = LiveScanPayload.parse(
+      raw,
+      target: _currentStep == ScanStep.price
+          ? LiveScanTarget.price
+          : LiveScanTarget.orderNumber,
+    );
+    if (parsed.isEmpty) return;
+
+    final OcrResult result = OcrResult(
+      rawText: raw,
+      amounts: parsed.amount == null ? [] : [parsed.amount!],
+      orderNumbers: parsed.orderNumber == null ? [] : [parsed.orderNumber!],
+    );
+
+    if (_currentStep == ScanStep.price) {
+      _handlePriceStepResult(result);
+    } else {
+      _handleOrderNumberStepResult(result);
+    }
+  }
+
+
+  /// ✅ زر البدء على الويب — يُظهره المستخدم لتفعيد الكاميرا.
+  Widget _buildWebStartButton() {
+    return Center(
+      child: FilledButton.icon(
+        key: const ValueKey<String>('camera-permission-button'),
+        onPressed: _isInitializing ? null : _startWebCamera,
+        icon: const Icon(Icons.camera_alt, size: 24),
+        label: const Text(
+          'ابدأ المسح بالكاميرا',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        style: FilledButton.styleFrom(
+          backgroundColor: AppColors.primary,
+          foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+        ),
+      ),
+    );
+  }
+
+  /// ✅ تشغيل الكاميرا على الويب بعد نقرة المستخدم.
+  Future<void> _startWebCamera() async {
+    setState(() {
+      _isInitializing = true;
+      _error = null;
+      _failureKind = CameraFailureKind.none;
+      _permissionPermanentlyDenied = false;
+      _waitingForUserStart = false;
+    });
+    try {
+      await _initializeCamera(fromUserGesture: true);
+      if (mounted) {
+        setState(() => _isInitializing = false);
+        _startWebFrameAnalysis();
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isInitializing = false;
+        _error = _webCameraErrorMessage(error);
+        _failureKind = CameraFailureKind.permission;
+        _waitingForUserStart = true;
+      });
+    }
+  }
+
+  /// ✅ بدء التحليل الفوري للكاميرا — فحص دوري + قراءة باركود
+  void _startWebFrameAnalysis() {
+    if (_webScanTimer != null) return;
+    _webScanTimer = Timer.periodic(const Duration(milliseconds: 1200), (_) {
+      if (!mounted ||
+          _controller?.value.isInitialized != true ||
+          _isProcessing ||
+          _stepSucceeded) {
+        return;
+      }
+      _captureAndAnalyze();
+    });
+  }
+
+  /// رسائل خطأ عربية واضحة للكاميرا على الويب.
+  String _webCameraErrorMessage(Object error) {
+    final String msg = error.toString();
+    if (msg.contains('NotAllowedError') || msg.contains('permission')) {
+      return 'تم رفض إذن الكاميرا. تأكد من السماح بالكاميرا في إعدادات المتصفح، ثم أعد المحاولة.';
+    }
+    if (msg.contains('NotFoundError')) {
+      return 'لم يتم العثور على كاميرا في هذا الجهاز.';
+    }
+    if (msg.contains('OverconstrainedError') ||
+        msg.contains('NotReadableError')) {
+      return 'الكاميرا مشغولة. أغلق التطبيقات الأخرى ثم أعد المحاولة.';
+    }
+    return 'تعذّر تشغيل الكاميرا في هذا متصفح. جرّب Chrome أو Safari بإصدار حديث.';
+  }
+
+
+  /// ✅ واجهة البث المباشر على الويب — نفس تجربة Android/iOS الأصلية
+  Widget _buildLiveWebPreview() {
+    final String? notice = _notice;
+    final bool isOrderNumberStep = _currentStep == ScanStep.orderNumber;
+    return Stack(
+      fit: StackFit.expand,
+      children: <Widget>[
+        // البث المباشر (CameraController → <video>)
+        _CameraPreviewBox(controller: _controller!),
+
+        // إطار المسح نفسه — موحد مع الأصلية تماماً
+        ScanBoxOverlay(
+          scanBoxSize: scanBoxSize,
+          instructions: isOrderNumberStep
+              ? 'ضع رقم الطلب أو الباركود داخل المربع'
+              : 'ضع سعر الطلب أو الباركود داخل المربع',
+        ),
+
+        // شريط الخطوات العلوي
+        Positioned(
+          top: 14, left: 16, right: 16,
+          child: _buildStepperHeader(),
+        ),
+
+        // علامة النجاح
+        if (_stepSucceeded)
+          ScanSuccessOverlay(
+            checkmarkKey: successKey,
+            message: _successMessage,
+          ),
+
+        // التنويهات
+        if (notice != null && !_stepSucceeded)
+          Positioned(
+            left: 20, right: 20,
+            bottom: isOrderNumberStep ? 190 : 140,
+            child: _ScanHint(text: notice, isWarning: true),
+          ),
+
+        // ✅ زر التقاط صورة سريع (Fast Capture) — بديل يدوي فوري
+        Positioned(
+          left: 0, right: 0, bottom: 24,
+          child: _buildFastCaptureButton(),
+        ),
+      ],
+    );
+  }
+
+  /// ✅ زر التقاط صورة سريع — يلتقط صورة ويقرأ الباركود/النص منها
+  Widget _buildFastCaptureButton() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: FilledButton.icon(
+        key: const ValueKey<String>('fast-capture-button'),
+        onPressed:
+            (_isProcessing || _controller == null) ? null : _captureAndAnalyze,
+        icon: _isProcessing
+            ? const SizedBox(
+                width: 18, height: 18,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.camera_rounded, size: 22),
+        label: Text(
+          _isProcessing ? 'جاري القراءة...' : 'التقاط صورة سريعة',
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
+        style: FilledButton.styleFrom(
+          backgroundColor: AppColors.primary,
+          foregroundColor: Colors.white,
+          minimumSize: const Size.fromHeight(56),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// ✅ التقاط صورة واحدة وقراءتها — خيار سريع إذا لم يلتقط البث التلقائي
+  Future<void> _captureAndAnalyze() async {
+    if (_isProcessing || _controller == null) return;
+    if (!mounted) return;
+    setState(() => _isProcessing = true);
+
+    try {
+      final Uint8List? imageBytes =
+          await _controller!.takePicture().then((XFile f) => f.readAsBytes());
+      if (imageBytes == null || imageBytes.isEmpty) return;
+
+      final WebImageBarcodeResult result =
+          await readBarcodesFromImage(imageBytes);
+      if (result.status == WebImageBarcodeStatus.ok &&
+          result.payloads.isNotEmpty &&
+          mounted) {
+        for (final String payload in result.payloads) {
+          _handleBarcode(raw: payload);
+          if (_stepSucceeded) break;
+        }
+      }
+    } catch (e) {
+      // لا شيء — نعيد المحاولة في المرة الكاشرة
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+
   /// شريط مؤشر الخطوات التتابعية في أعلى شاشة الكاميرا.
   Widget _buildStepperHeader() {
     final bool isPriceStep = _currentStep == ScanStep.price;

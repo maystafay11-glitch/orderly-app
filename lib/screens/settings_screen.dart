@@ -9,7 +9,11 @@ import 'package:orderly_app/screens/unified_login_screen.dart';
 import 'package:orderly_app/services/app_settings.dart';
 import 'package:orderly_app/services/auth_session_service.dart';
 import 'package:orderly_app/services/driver_storage.dart';
+import 'package:orderly_app/services/firebase_realtime_service.dart';
+import 'package:orderly_app/services/firebase_tracking_service.dart';
+import 'package:orderly_app/services/restaurant_service.dart';
 import 'package:orderly_app/theme/app_theme.dart';
+
 
 /// أرقام دولية نموذجية تساعد في توجيه المستخدم لتنسيق الرقم الصحيح.
 const List<String> kExamplePhones = <String>[
@@ -31,8 +35,11 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   final TextEditingController _controller = TextEditingController();
+  final TextEditingController _firebaseController = TextEditingController();
   String _savedPhone = '';
   String _adminPin = AppSettings.defaultAdminPin;
+  String _firebaseUrl = '';
+  String _restaurantId = '';
   List<Driver> _drivers = <Driver>[];
   bool _isLoading = true;
   String? _error;
@@ -47,6 +54,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _loadSettings() async {
     final String phone = await AppSettings.getWhatsAppPhone();
     final String adminPin = await AppSettings.getAdminPin();
+    final String firebaseUrl = await AppSettings.getFirebaseDatabaseUrl();
     final List<Driver> drivers = await DriverStorage.loadDrivers();
     if (!mounted) {
       return;
@@ -55,6 +63,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _savedPhone = phone;
       _controller.text = phone;
       _adminPin = adminPin;
+      _firebaseUrl = firebaseUrl;
+      _firebaseController.text = firebaseUrl;
+      _restaurantId = RestaurantService.restaurantId;
       _drivers = drivers;
       _isLoading = false;
     });
@@ -302,9 +313,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ..showSnackBar(SnackBar(content: Text(message)));
   }
 
+  /// حفظ رابط Firebase Database وإعادة تهيئة الاتصال.
+  Future<void> _saveFirebaseUrl() async {
+    final String url = _firebaseController.text.trim();
+    await AppSettings.setFirebaseDatabaseUrl(url);
+    setState(() => _firebaseUrl = url);
+    // إعادة تهيئة Firebase مع URL الجديد
+    await FirebaseTrackingService.instance.reinitializeFirebase();
+    if (!mounted) return;
+    _showMessage(url.isEmpty
+        ? 'تم مسح رابط Firebase — يعمل التطبيق محلياً فقط'
+        : 'تم ربط Firebase وبدء المزامنة ✅');
+  }
+
   @override
   void dispose() {
     _controller.dispose();
+    _firebaseController.dispose();
     super.dispose();
   }
 
@@ -551,7 +576,191 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 22),
 
-                // 3. زر تسجيل خروج المدير من الإعدادات
+                // 3. بطاقة معرّف المطعم (Restaurant ID)
+                Card(
+                  elevation: 2,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Row(
+                          children: <Widget>[
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: AppColors.accent.withValues(alpha: 0.1),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: const Icon(Icons.store_outlined, color: AppColors.accent),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: <Widget>[
+                                  Text('معرّف المطعم (Restaurant ID)',
+                                      style: text.titleSmall?.copyWith(fontWeight: FontWeight.bold)),
+                                  Text('يُستخدم لعزل بيانات مطعمك في السحابة',
+                                      style: text.bodySmall?.copyWith(color: AppColors.textSecondary)),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const Divider(height: 20),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: AppColors.surface,
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: AppColors.border),
+                          ),
+                          child: Row(
+                            children: <Widget>[
+                              const Icon(Icons.fingerprint, color: AppColors.accent, size: 20),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  _restaurantId.isEmpty ? 'جارٍ التوليد...' : _restaurantId,
+                                  key: const ValueKey<String>('restaurant-id-display'),
+                                  style: const TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.bold,
+                                    letterSpacing: 1.5,
+                                  ),
+                                ),
+                              ),
+                              IconButton(
+                                key: const ValueKey<String>('copy-restaurant-id'),
+                                tooltip: 'نسخ المعرّف',
+                                icon: const Icon(Icons.copy_outlined, size: 18),
+                                onPressed: () {
+                                  Clipboard.setData(ClipboardData(text: _restaurantId));
+                                  _showMessage('تم نسخ معرّف المطعم ✅ شاركه مع السائقين');
+                                },
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'شارك هذا المعرّف مع سائقيك ليتصلوا بنفس حساب مطعمك.',
+                          style: text.bodySmall?.copyWith(color: AppColors.textSecondary),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+
+                // 4. بطاقة ربط Firebase السحابي
+                Card(
+                  elevation: 2,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Row(
+                          children: <Widget>[
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFFF6B00).withValues(alpha: 0.1),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: const Icon(Icons.cloud_sync_outlined, color: Color(0xFFFF6B00)),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: <Widget>[
+                                  Text('ربط Firebase (مزامنة لحظية)',
+                                      style: text.titleSmall?.copyWith(fontWeight: FontWeight.bold)),
+                                  StreamBuilder<FirebaseConnectionState>(
+                                    stream: FirebaseRealtimeService.instance.connectionStateStream,
+                                    initialData: FirebaseRealtimeService.instance.connectionState,
+                                    builder: (BuildContext context,
+                                        AsyncSnapshot<FirebaseConnectionState> snap) {
+                                      final FirebaseConnectionState state =
+                                          snap.data ?? FirebaseConnectionState.notConfigured;
+                                      Color color;
+                                      String label;
+                                      switch (state) {
+                                        case FirebaseConnectionState.connected:
+                                          color = AppColors.success;
+                                          label = '● متصل ومزامَن';
+                                        case FirebaseConnectionState.connecting:
+                                          color = Colors.orange;
+                                          label = '● جارٍ الاتصال...';
+                                        case FirebaseConnectionState.disconnected:
+                                          color = AppColors.danger;
+                                          label = '● منقطع — إعادة محاولة';
+                                        case FirebaseConnectionState.notConfigured:
+                                          color = AppColors.textSecondary;
+                                          label = '● غير مفعّل (وضع محلي)';
+                                        case FirebaseConnectionState.error:
+                                          color = AppColors.danger;
+                                          label = '● خطأ في الإعداد';
+                                      }
+                                      return Text(label,
+                                          style: TextStyle(fontSize: 11, color: color));
+                                    },
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const Divider(height: 20),
+                        Text(
+                          'أدخل رابط Firebase Realtime Database لتزامن الطلبات بين المدير والسائقين لحظياً.\n'
+                          'اتركه فارغاً للعمل محلياً بدون سحابة.',
+                          style: text.bodySmall?.copyWith(height: 1.5),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          key: const ValueKey<String>('firebase-url-field'),
+                          controller: _firebaseController,
+                          keyboardType: TextInputType.url,
+                          decoration: const InputDecoration(
+                            labelText: 'Firebase Database URL',
+                            hintText: 'https://project-default-rtdb.firebaseio.com',
+                            prefixIcon: Icon(Icons.link_outlined),
+                          ),
+                        ),
+                        const SizedBox(height: 14),
+                        SizedBox(
+                          width: double.infinity,
+                          child: FilledButton.icon(
+                            key: const ValueKey<String>('save-firebase-url'),
+                            style: FilledButton.styleFrom(backgroundColor: const Color(0xFFFF6B00)),
+                            onPressed: _saveFirebaseUrl,
+                            icon: const Icon(Icons.cloud_done_outlined, size: 18),
+                            label: const Text('حفظ وتفعيل المزامنة'),
+                          ),
+                        ),
+                        if (_firebaseUrl.isNotEmpty) ...<Widget>[
+                          const SizedBox(height: 8),
+                          Text(
+                            'مُفعَّل: $_firebaseUrl',
+                            style: text.bodySmall?.copyWith(color: AppColors.success, fontSize: 10),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 22),
+
+                // 5. زر تسجيل خروج المدير
                 SizedBox(
                   width: double.infinity,
                   child: OutlinedButton.icon(
@@ -577,7 +786,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Text(
                   '• يتم حفظ الجلسة محلياً ليبقى التطبيق مفتوحاً طوال اليوم.\n'
                   '• عند الضغط على تسجيل الخروج، يُعاد طلب الرمز السري فوراً.\n'
-                  '• رمز المدير يفتح لوحة التحكم الكاملة، بينما تقتصر رموز السائقين على متابعة توصيل طلباتهم فقط.',
+                  '• رمز المدير يفتح لوحة التحكم الكاملة، بينما تقتصر رموز السائقين على متابعة توصيل طلباتهم فقط.\n'
+                  '• معرّف المطعم يضمن عزل بياناتك تماماً عن المطاعم الأخرى في Firebase.',
                   style: text.bodySmall?.copyWith(height: 1.6),
                 ),
               ],
@@ -585,4 +795,3 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 }
-

@@ -56,6 +56,22 @@ flutter test     # اختبارات النموذج + التخزين + منطق O
 flutter run      # يحتاج جهازاً/محاكياً بكاميرا لتجربة المسح الضوئي
 ```
 
+## Worker Web App (iPhone)
+
+هذه نسخة ويب مستقلة للعامل فقط؛ لا تحتوي على لوحة المدير أو إعداداته. تستخدم
+نفس مسار Firebase الخاص بالـ APK (`restaurants/{Restaurant ID}/snapshot`) كي
+تتزامن الطلبات وحالاتها كل 3 ثوانٍ تقريباً في الاتجاهين.
+
+```bash
+flutter build web --target lib/worker_web_main.dart --dart-define=FIREBASE_DATABASE_URL=https://YOUR_DATABASE.firebaseio.com
+```
+
+انشر محتويات `build/web` على أي استضافة HTTPS. يدخل العامل `Restaurant ID`
+واسم المستخدم وكلمة المرور أو PIN، ويمكنه إنشاء طلب وإرفاق صورة من كاميرا
+iPhone. يجب أن يكون حساب العامل موجوداً في Firebase تحت:
+`restaurants/{Restaurant ID}/staff/{staffId}`، وأن تسمح قواعد Firebase بالوصول
+المناسب للمطعم.
+
 ## ملاحظات
 
 - **iOS**: الحد الأدنى للإصدار 15.5 (متطلب ML Kit) في `ios/Podfile` و

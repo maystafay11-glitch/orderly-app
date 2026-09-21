@@ -4,9 +4,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import 'package:orderly_app/models/driver.dart';
+import 'package:orderly_app/models/staff_member.dart';
 import 'package:orderly_app/screens/driver_dashboard_screen.dart';
 import 'package:orderly_app/screens/home_screen.dart';
 import 'package:orderly_app/services/auth_session_service.dart';
+import 'package:orderly_app/services/driver_storage.dart';
+import 'package:orderly_app/services/restaurant_service.dart';
+import 'package:orderly_app/services/staff_directory_service.dart';
+import 'package:orderly_app/services/staff_session_service.dart';
 import 'package:orderly_app/theme/app_theme.dart';
 
 /// واجهة تسجيل الدخول الموحدة — Dark Mode احترافي
@@ -28,10 +34,25 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
     with TickerProviderStateMixin {
   final TextEditingController _pinController = TextEditingController();
 
+  /// حقل معرّف المطعم الإجباري (Restaurant ID) — يُملأ تلقائياً بمعرّف
+  /// هذا الجهاز إن وُجد، مع إمكانية تعديله للدخول لمطعم آخر.
+  final TextEditingController _restaurantIdController =
+      TextEditingController();
+
+  /// حقل اسم المستخدم (فارغ = المسار السريع القديم برمز PIN للجهاز).
+  final TextEditingController _usernameController = TextEditingController();
+
   String _pin = '';
   bool _isLoading = false;
   String? _errorMessage;
   _LoginMode _mode = _LoginMode.none;
+
+  /// هل المستخدم في وضع تسجيل دخول الحساب (معرّف مطعم + اسم مستخدم)؟
+  bool get _isStaffMode => _usernameController.text.trim().isNotEmpty;
+
+  /// أقصى طول للرمز السري: كلمة مرور حساب حتى 8 خانات،
+  /// بينما رمز الجهاز السريع يبقى قصيراً كما هو.
+  int get _maxSecretLength => _isStaffMode ? 8 : 6;
 
   // انيميشن الانتقال بين المرحلتين (محجوز للمستقبل)
   late final AnimationController _transitionCtrl;
@@ -46,6 +67,9 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
   @override
   void initState() {
     super.initState();
+
+    // تعبئة معرّف المطعم تلقائياً من معرّف هذا الجهاز (Multi-tenant).
+    _restaurantIdController.text = RestaurantService.restaurantId;
 
     _transitionCtrl = AnimationController(
       vsync: this,
@@ -69,6 +93,8 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
   @override
   void dispose() {
     _pinController.dispose();
+    _restaurantIdController.dispose();
+    _usernameController.dispose();
     _transitionCtrl.dispose();
     _shakeCtrl.dispose();
     _bgCtrl.dispose();
@@ -81,6 +107,7 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
       _mode = mode;
       _pin = '';
       _pinController.clear();
+      _usernameController.clear();
       _errorMessage = null;
     });
     _transitionCtrl.forward(from: 0);
@@ -92,6 +119,7 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
       _mode = _LoginMode.none;
       _pin = '';
       _pinController.clear();
+      _usernameController.clear();
       _errorMessage = null;
       _isLoading = false;
     });
@@ -99,7 +127,7 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
   }
 
   void _onDigitPressed(String digit) {
-    if (_pin.length >= 6 || _isLoading) return;
+    if (_pin.length >= _maxSecretLength || _isLoading) return;
     HapticFeedback.selectionClick();
     _setPin(_pin + digit);
   }
@@ -115,19 +143,185 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
     _setPin('');
   }
 
+  /// تحديث حالة الواجهة عند تعديل حقول الهوية (معرّف المطعم / اسم المستخدم):
+  /// يبدّل تلقائياً بين وضع حساب الموظف والوضع السريع القديم.
+  void _onIdentityFieldChanged() {
+    setState(() {
+      _errorMessage = null;
+      if (!_isStaffMode && _pin.length > 6) {
+        _pin = _pin.substring(0, 6);
+        _pinController.text = _pin;
+      }
+    });
+  }
+
   void _setPin(String value) {
     setState(() {
       _pin = value;
       _pinController.text = value;
       _errorMessage = null;
     });
-    if (_pin.length == 4) {
+    // التحقق التلقائي عند 4 أرقام يعمل فقط في المسار السريع القديم
+    // (بدون اسم مستخدم). أما حساب الموظف فيتحقق بزر «دخول» ليدعم
+    // كلمات المرور الأطول من 4 خانات.
+    if (_pin.length == 4 && !_isStaffMode) {
       _verifyPin(_pin);
     }
   }
 
+  /// زر «دخول»: يوجّه بين مسار الحساب الكامل (معرّف مطعم + اسم مستخدم +
+  /// كلمة مرور/PIN) والمسار السريع القديم (رمز الجهاز فقط).
+  Future<void> _submit() async {
+    if (_isLoading) return;
+
+    if (_restaurantIdController.text.trim().isEmpty) {
+      setState(() {
+        _errorMessage = 'يرجى إدخال معرّف المطعم قبل تسجيل الدخول.';
+      });
+      _shakeCtrl.forward(from: 0);
+      return;
+    }
+
+    final String username = _usernameController.text.trim();
+    if (username.isEmpty) {
+      // المسار السريع القديم — رمز PIN للجهاز (سلوك سابق محفوظ).
+      if (_pin.length < 4) {
+        setState(() {
+          _errorMessage =
+              'أدخل الرمز السري كاملاً (4 أرقام) أو أكمل بيانات الحساب '
+              '(معرّف المطعم + اسم المستخدم).';
+        });
+        _shakeCtrl.forward(from: 0);
+        return;
+      }
+      await _verifyPin(_pin);
+      return;
+    }
+
+    await _authenticateStaff(
+      restaurantId: _restaurantIdController.text,
+      username: username,
+      secret: _pin,
+    );
+  }
+
+  /// مصادقة حساب موظف (عامل أو مدير) عبر [StaffDirectoryService]،
+  /// ثم حفظ جلسة دائمة وآمنة عبر [StaffSessionService] والانتقال للشاشة.
+  Future<void> _authenticateStaff({
+    required String restaurantId,
+    required String username,
+    required String secret,
+  }) async {
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+
+    final StaffAuthResult result = await StaffDirectoryService.authenticate(
+      restaurantId: restaurantId,
+      username: username,
+      secret: secret,
+    );
+
+    if (!mounted) return;
+
+    if (!result.success || result.staff == null) {
+      HapticFeedback.vibrate();
+      _shakeCtrl.forward(from: 0);
+      setState(() {
+        _isLoading = false;
+        _errorMessage = result.message ?? 'بيانات الدخول غير صحيحة.';
+        _pin = '';
+        _pinController.clear();
+      });
+      return;
+    }
+
+    final StaffMember staff = result.staff!;
+
+    // حساب عامل — يجب إيجاد بيانات ورديته على هذا الجهاز لفتح لوحته.
+    Driver? driver;
+    if (staff.isWorker) {
+      driver = await _resolveDriverForStaff(staff);
+      if (driver == null) {
+        setState(() {
+          _isLoading = false;
+          _errorMessage =
+              'تم التحقق من الحساب بنجاح، لكن لا توجد بيانات وردية لهذا '
+              'العامل على هذا الجهاز بعد. تأكد من إعداد مزامنة Firebase '
+              'في الإعدادات ثم أعد المحاولة.';
+          _pin = '';
+          _pinController.clear();
+        });
+        return;
+      }
+    }
+
+    // حفظ الجلسة في Secure Storage — تبقى مسجلاً للدخول بشكل دائم.
+    await StaffSessionService.saveSession(StaffSession.fromStaff(staff));
+    if (!mounted) return;
+
+    HapticFeedback.heavyImpact();
+    setState(() => _isLoading = false);
+
+    final Widget target = staff.isManager
+        ? const HomeScreen()
+        : DriverDashboardScreen(driver: driver!);
+    Navigator.of(context).pushReplacement(
+      PageRouteBuilder<void>(
+        pageBuilder: (_, __, ___) => target,
+        transitionsBuilder: (_, Animation<double> anim, __, Widget child) {
+          return FadeTransition(opacity: anim, child: child);
+        },
+        transitionDuration: const Duration(milliseconds: 500),
+      ),
+    );
+  }
+
+  /// إيجاد بيانات العامل (بالرمز ثم بالاسم) مع انتظار قصير للمزامنة
+  /// السحابية إن كان رابط Firebase مضبوطاً.
+  Future<Driver?> _resolveDriverForStaff(StaffMember staff) async {
+    Driver? driver = await DriverStorage.loadDriverByPin(staff.driverPin);
+    driver ??= await _findDriverByName(staff.name);
+    if (driver != null) return driver;
+
+    final String dbUrl = await StaffDirectoryService.resolveDatabaseUrl();
+    if (dbUrl.isEmpty) return null;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+      await Future<void>.delayed(const Duration(seconds: 2));
+      if (!mounted) return null;
+      driver = await DriverStorage.loadDriverByPin(staff.driverPin);
+      driver ??= await _findDriverByName(staff.name);
+      if (driver != null) return driver;
+    }
+    return driver;
+  }
+
+  /// إيجاد سائق باسمه (مقارنة موحّدة الحالة والمسافات).
+  Future<Driver?> _findDriverByName(String name) async {
+    final String needle = StaffMember.normalizeUsername(name);
+    if (needle.isEmpty) return null;
+    final List<Driver> drivers = await DriverStorage.loadDrivers();
+    for (final Driver driver in drivers) {
+      if (StaffMember.normalizeUsername(driver.name) == needle) {
+        return driver;
+      }
+    }
+    return null;
+  }
+
   Future<void> _verifyPin(String enteredPin) async {
     if (_isLoading) return;
+    if (_restaurantIdController.text.trim().isEmpty) {
+      setState(() {
+        _errorMessage = 'يرجى إدخال معرّف المطعم قبل تسجيل الدخول.';
+      });
+      _shakeCtrl.forward(from: 0);
+      return;
+    }
     setState(() => _isLoading = true);
 
     await Future<void>.delayed(const Duration(milliseconds: 300));
@@ -218,6 +412,11 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
                       onDigit: _onDigitPressed,
                       onBackspace: _onBackspace,
                       onClear: _onClear,
+                      restaurantIdController: _restaurantIdController,
+                      usernameController: _usernameController,
+                      isStaffMode: _isStaffMode,
+                      onSubmit: _submit,
+                      onIdentityFieldChanged: _onIdentityFieldChanged,
                     ),
             ),
           ),
@@ -648,6 +847,11 @@ class _PinView extends StatelessWidget {
     required this.onDigit,
     required this.onBackspace,
     required this.onClear,
+    required this.restaurantIdController,
+    required this.usernameController,
+    required this.isStaffMode,
+    required this.onSubmit,
+    required this.onIdentityFieldChanged,
   });
 
   final _LoginMode mode;
@@ -659,16 +863,21 @@ class _PinView extends StatelessWidget {
   final void Function(String) onDigit;
   final VoidCallback onBackspace;
   final VoidCallback onClear;
+  final TextEditingController restaurantIdController;
+  final TextEditingController usernameController;
+  final bool isStaffMode;
+  final VoidCallback onSubmit;
+  final VoidCallback onIdentityFieldChanged;
 
   bool get _isAdmin => mode == _LoginMode.admin;
   Color get _modeColor => _isAdmin ? AppColors.primary : AppColors.accent;
   IconData get _modeIcon => _isAdmin
       ? Icons.admin_panel_settings_rounded
       : Icons.two_wheeler_rounded;
-  String get _modeLabel => _isAdmin ? 'رمز المدير السري' : 'رمز السائق السري';
+  String get _modeLabel => _isAdmin ? 'حساب المدير' : 'حساب العامل';
   String get _modeHint => _isAdmin
-      ? 'أدخل رمز المدير للوصول إلى لوحة التحكم'
-      : 'أدخل رمزك الشخصي للوصول إلى واجهة التوصيل';
+      ? 'أدخل معرّف المطعم واسم المستخدم وكلمة المرور للوصول إلى لوحة التحكم'
+      : 'أدخل معرّف المطعم واسمك وكلمة المرور أو رمز PIN الخاص بك';
 
   @override
   Widget build(BuildContext context) {
@@ -710,9 +919,14 @@ class _PinView extends StatelessWidget {
                     color: AppColors.textSecondary,
                   ),
                 ),
-                const SizedBox(height: 32),
+                const SizedBox(height: 16),
 
-                // ── خانات PIN ─────────────────────────────────────
+                // ── بيانات الحساب (معرّف المطعم + اسم المستخدم) ────
+                _buildIdentityFields(),
+
+                const SizedBox(height: 16),
+
+                // ── خانات كلمة المرور / PIN ───────────────────────
                 AnimatedBuilder(
                   animation: shakeAnim,
                   builder: (_, Widget? child) {
@@ -725,6 +939,11 @@ class _PinView extends StatelessWidget {
                   },
                   child: _buildPinDots(),
                 ),
+
+                const SizedBox(height: 14),
+
+                // ── زر الدخول ─────────────────────────────────────
+                _buildLoginButton(),
 
                 // ── رسالة الخطأ ───────────────────────────────────
                 if (errorMessage != null) ...<Widget>[
@@ -827,10 +1046,135 @@ class _PinView extends StatelessWidget {
     );
   }
 
+  /// حقول الهوية الإجبارية لتسجيل دخول الحساب:
+  /// معرّف المطعم (Restaurant ID) + اسم المستخدم.
+  /// ترك اسم المستخدم فارغاً يُبقي المسار السريع القديم برمز الجهاز.
+  Widget _buildIdentityFields() {
+    return Column(
+      children: <Widget>[
+        TextField(
+          key: const ValueKey<String>('login-restaurant-id-field'),
+          controller: restaurantIdController,
+          enabled: !isLoading,
+          textDirection: TextDirection.ltr,
+          style: GoogleFonts.cairo(
+            fontSize: 14,
+            fontWeight: FontWeight.w700,
+            color: AppColors.textPrimary,
+          ),
+          decoration: _identityDecoration(
+            label: 'معرّف المطعم (Restaurant ID) *',
+            hint: 'مثال: A1B2C3D4E5F6G7H8',
+            icon: Icons.storefront_rounded,
+          ),
+          onChanged: (_) => onIdentityFieldChanged(),
+        ),
+        const SizedBox(height: 10),
+        TextField(
+          key: const ValueKey<String>('login-username-field'),
+          controller: usernameController,
+          enabled: !isLoading,
+          style: GoogleFonts.cairo(
+            fontSize: 14,
+            fontWeight: FontWeight.w700,
+            color: AppColors.textPrimary,
+          ),
+          decoration: _identityDecoration(
+            label: 'اسم المستخدم *',
+            hint: isStaffMode
+                ? 'وضع حساب الموظف مفعّل ✓'
+                : 'اتركه فارغاً للدخول السريع برمز الجهاز',
+            icon: Icons.badge_rounded,
+          ),
+          onChanged: (_) => onIdentityFieldChanged(),
+        ),
+      ],
+    );
+  }
+
+  /// تنسيق موحد لحقول الهوية (وضع داكن متناسق مع هوية التطبيق).
+  InputDecoration _identityDecoration({
+    required String label,
+    required String hint,
+    required IconData icon,
+  }) {
+    return InputDecoration(
+      labelText: label,
+      hintText: hint,
+      prefixIcon: Icon(icon, size: 18, color: _modeColor),
+      filled: true,
+      fillColor: AppColors.field,
+      isDense: true,
+      contentPadding: const EdgeInsets.symmetric(
+        horizontal: 14,
+        vertical: 12,
+      ),
+      labelStyle: GoogleFonts.cairo(
+        fontSize: 11.5,
+        color: AppColors.textSecondary,
+      ),
+      hintStyle: GoogleFonts.cairo(fontSize: 11, color: AppColors.textMuted),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: const BorderSide(color: AppColors.border, width: 1.2),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: BorderSide(
+          color: _modeColor.withValues(alpha: 0.6),
+          width: 1.6,
+        ),
+      ),
+      disabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(14),
+        borderSide: const BorderSide(color: AppColors.border, width: 1.2),
+      ),
+    );
+  }
+
+  /// زر الدخول: مصادقة الحساب الكامل أو المسار السريع القديم.
+  Widget _buildLoginButton() {
+    return SizedBox(
+      width: double.infinity,
+      height: 48,
+      child: FilledButton.icon(
+        key: const ValueKey<String>('staff-login-btn'),
+        style: FilledButton.styleFrom(
+          backgroundColor: _modeColor,
+          foregroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          disabledBackgroundColor: _modeColor.withValues(alpha: 0.5),
+        ),
+        onPressed: isLoading ? null : onSubmit,
+        icon: isLoading
+            ? const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2.4,
+                  color: Colors.white,
+                ),
+              )
+            : const Icon(Icons.login_rounded, size: 20),
+        label: Text(
+          isStaffMode ? 'دخول بحساب الموظف' : 'دخول سريع (رمز الجهاز)',
+          style: GoogleFonts.cairo(
+            fontSize: 14.5,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildPinDots() {
+    // عدد الخانات ديناميكي: 4 أساسياً، ويزيد لكلمات المرور الأطول.
+    final int dotCount = pin.length < 4 ? 4 : pin.length;
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
-      children: List<Widget>.generate(4, (int i) {
+      children: List<Widget>.generate(dotCount, (int i) {
         final bool filled = i < pin.length;
         final bool isCurrentLoading = isLoading && i == pin.length - 1;
 

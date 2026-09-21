@@ -32,28 +32,33 @@ dependencies:
     sdk: flutter
 
   # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   google_fonts: ^8.2.1
   shared_preferences: ^2.5.5
+
+  # ── OCR والكاميرا (Android/iOS فقط) ──────────────────────────────────────
   google_mlkit_text_recognition: ^0.16.0
   google_mlkit_commons: ^0.12.0
   camera: ^0.12.0+2
   permission_handler: 12.0.3
   url_launcher: ^6.3.1
-
-  # الالتقاط بالصورة الثابتة (Snapshot) على الويب:
-  # يفتح كاميرا الجهاز أو معرض الصور عبر <input type="file"> — بدون أي بث
-  # فيديو مباشر، وبلا شاشة سوداء على Safari/Chrome.
   image_picker: ^1.2.3
 
-  # معالجة الصورة الملتقطة (قصّ إطار المسح + تكبير + تباين) قبل القراءة،
-  # وهي مكتبة Dart خالصة تعمل على الويب والأجهزة الأصلية.
+  # معالجة الصورة قبل القراءة (قصّ + تكبير + تباين) — Dart خالصة.
   image: ^4.10.1
 
-  # واجهات المتصفح (DOM) — تُستخدم فقط على Flutter Web لقراءة الباركود من
-  # صورة ثابتة (BarcodeDetector) عبر lib/utils/web_barcode_image.dart.
+  # ── Firebase REST API (Multi-tenant Cloud Sync) ───────────────────────────
+  # نستخدم REST API مباشرة بدون google-services.json:
+  # المطعم يُدخل فقط رابط Firebase Database URL في الإعدادات ويبدأ التزامن.
+  http: ^1.4.0
+
+  # ── Restaurant ID الفريد (Multi-tenant Isolation) ─────────────────────────
+  uuid: ^4.5.1
+
+  # ── واجهات المتصفح (للويب فقط — محفوظة للتوافق) ─────────────────────────
   web: ^1.1.1
+  crypto: ^3.0.7
+  flutter_secure_storage: ^11.2.0
 
 dev_dependencies:
   flutter_test:

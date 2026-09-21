@@ -9,6 +9,7 @@ import 'package:orderly_app/services/app_settings.dart';
 import 'package:orderly_app/services/auth_session_service.dart';
 import 'package:orderly_app/services/driver_storage.dart';
 import 'package:orderly_app/services/license_service.dart';
+import 'package:orderly_app/services/restaurant_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// مساعد: يُجري pump كافٍ لإنهاء الانتقالات القصيرة دون أن ينتظر
@@ -25,6 +26,7 @@ void main() {
     await AppSettings.clearAll();
     await DriverStorage.clear();
     await AuthSessionService.logout();
+    await RestaurantService.init();
   });
 
   group('AuthSessionService tests', () {
