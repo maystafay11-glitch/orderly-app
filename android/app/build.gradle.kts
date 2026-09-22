@@ -22,7 +22,7 @@ android {
     defaultConfig {
         applicationId = "com.orderly.orderly_app"
         // Android 5.0+ (API 21) مطلوب لـ: camera, permission_handler, HTTP TLS 1.2
-        minSdk = 21
+        minSdk = flutter.minSdkVersion
         targetSdk = 35
         versionCode = flutter.versionCode
         versionName = flutter.versionName
