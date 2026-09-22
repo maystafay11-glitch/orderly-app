@@ -30,6 +30,10 @@
 /build/unit_test_assets/
 /build/url_launcher_android/
 /build/.cxx/
+/build/flutter_secure_storage/
+/build/image_picker_android/
+/build/flutter_assets/
+/build/befd398a3b41d11ebd8cf01b59eef68f/
 
 # ─── IntelliJ / Android Studio ──────────────────────────────────
 *.iml
