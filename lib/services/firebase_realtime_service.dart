@@ -46,6 +46,19 @@ enum FirebaseConnectionState {
   error,
 }
 
+/// نتيجة محاولة كتابة snapshot محمية بـ ETag.
+enum SnapshotPushOutcome {
+  /// كُتبت بنجاح.
+  success,
+
+  /// تغيّر المستند على جهاز آخر بين القراءة والكتابة (HTTP 412)
+  /// — نُعيد القراءة بدل الكتابة فوق تغييرات العامل.
+  conflict,
+
+  /// فشل شبكي أو رد غير متوقع.
+  failure,
+}
+
 class FirebaseRealtimeService {
   FirebaseRealtimeService._();
 
@@ -57,6 +70,10 @@ class FirebaseRealtimeService {
   String _restaurantId = '';
   Timer? _pollingTimer;
   int _lastHeartbeat = 0;
+
+  /// رمز ETag لآخر `snapshot` قُرِئ من السحابة — يُستخدم لجعل الكتابة محمية
+  /// من الكتابة فوق تغييرات جهاز آخر (العامل على الويب مثلاً).
+  String? _lastSnapshotEtag;
 
   final StreamController<Map<String, dynamic>> _snapshotController =
       StreamController<Map<String, dynamic>>.broadcast();
@@ -119,6 +136,7 @@ class FirebaseRealtimeService {
   void dispose() {
     _pollingTimer?.cancel();
     _pollingTimer = null;
+    _lastSnapshotEtag = null;
     _setState(FirebaseConnectionState.notConfigured);
   }
 
@@ -153,6 +171,52 @@ class FirebaseRealtimeService {
       debugPrint('[Firebase] pushSnapshot خطأ: $e');
       _setState(FirebaseConnectionState.disconnected);
       return false;
+    }
+  }
+
+  /// كتابة `snapshot` محمية بـ ETag.
+  ///
+  /// تُستخدم من تطبيق المدير: إن كان جهاز آخر (واجهة العامل مثلاً) قد كتب
+  /// مستنداً أحدث بين آخر قراءة وهذه الكتابة، يُرفض الطلب بـ `412` بدل
+  /// الكتابة فوق تعديلاته، فيُبلَّغ المستدعي ([SnapshotPushOutcome.conflict])
+  /// ليعيد القراءة والدمج ثم المحاولة مرة أخرى.
+  Future<SnapshotPushOutcome> pushSnapshotGuarded(
+    Map<String, dynamic> data,
+  ) async {
+    if (!isConfigured || _restaurantId.isEmpty) {
+      return SnapshotPushOutcome.failure;
+    }
+
+    try {
+      final String etag = _lastSnapshotEtag ?? '';
+      final http.Response response = await http
+          .put(
+            Uri.parse(
+              '$_databaseUrl/restaurants/$_restaurantId/snapshot.json',
+            ),
+            headers: <String, String>{
+              'Content-Type': 'application/json',
+              if (etag.isNotEmpty) 'If-Match': etag,
+            },
+            body: jsonEncode(data),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 412) {
+        debugPrint('[Firebase] تعارض ETag — مستند أحدث على جهاز آخر');
+        return SnapshotPushOutcome.conflict;
+      }
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        await _updateHeartbeat();
+        _setState(FirebaseConnectionState.connected);
+        return SnapshotPushOutcome.success;
+      }
+      debugPrint('[Firebase] pushSnapshotGuarded فشل: ${response.statusCode}');
+      return SnapshotPushOutcome.failure;
+    } catch (e) {
+      debugPrint('[Firebase] pushSnapshotGuarded خطأ: $e');
+      _setState(FirebaseConnectionState.disconnected);
+      return SnapshotPushOutcome.failure;
     }
   }
 
@@ -205,6 +269,9 @@ class FirebaseRealtimeService {
   // ─── قراءة البيانات ───────────────────────────────────────────────────────
 
   /// قراءة snapshot كامل مباشرة من Firebase (للمزامنة الأولية).
+  ///
+  /// تُخزَّن قيمة `ETag` المرجَعة لتُستخدم لاحقاً في الكتابة المحمية
+  /// ([pushSnapshotGuarded]) بدل الكتابة فوق تغييرات جهاز آخر.
   Future<Map<String, dynamic>?> fetchSnapshot() async {
     if (!isConfigured || _restaurantId.isEmpty) return null;
 
@@ -212,8 +279,13 @@ class FirebaseRealtimeService {
       final String url =
           '$_databaseUrl/restaurants/$_restaurantId/snapshot.json';
       final http.Response response = await http
-          .get(Uri.parse(url))
+          .get(
+            Uri.parse(url),
+            headers: <String, String>{'X-Firebase-ETag': 'true'},
+          )
           .timeout(const Duration(seconds: 10));
+
+      _lastSnapshotEtag = response.headers['etag'] ?? _lastSnapshotEtag;
 
       if (response.statusCode == 200 && response.body != 'null') {
         final dynamic decoded = jsonDecode(response.body);

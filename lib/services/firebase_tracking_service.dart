@@ -5,6 +5,7 @@ import 'package:orderly_app/models/delivery_order.dart';
 import 'package:orderly_app/models/driver.dart';
 import 'package:orderly_app/models/order_status.dart';
 import 'package:orderly_app/models/shift_record.dart';
+import 'package:orderly_app/models/staff_member.dart';
 import 'package:orderly_app/services/app_settings.dart';
 import 'package:orderly_app/services/audio_alert_service.dart';
 import 'package:orderly_app/services/driver_storage.dart';
@@ -37,6 +38,12 @@ class FirebaseTrackingService {
   StreamSubscription<Map<String, dynamic>>? _remoteSubscription;
 
   bool _listeningToRemote = false;
+
+  /// لحظة آخر لقطة سحابية قرأها/طبّقها هذا الجهاز.
+  ///
+  /// تُستخدم كعلامة مائية للتمييز بين «طلب جديد أضافه جهاز آخر ولم يُقرأ بعد»
+  /// (يُدمج فلا يُفقد) و«طلب قديم حذفه المدير محلياً» (لا يُعاد إحياؤه).
+  DateTime _lastCloudSnapshotAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   // ─── الواجهة العامة ───────────────────────────────────────────────────────
 
@@ -246,28 +253,85 @@ class FirebaseTrackingService {
   }
 
   /// تطبيق snapshot وارد من Firebase على البيانات المحلية.
+  ///
+  /// **حماية من الفقدان:** `snapshot` مستند كامل، فاستبدال المحلي بالوارد
+  /// قد يُلغي طلباً أضافه هذا الجهاز ولم يُنشر بعد. لذلك نُبقي أي طلب محلي
+  /// أُضيف بعد آخر قراءة سحابية ([_lastCloudSnapshotAt]) بدل إسقاطه.
   Future<void> _applyRemoteSnapshot(Map<String, dynamic> snapshot) async {
     try {
-      // استخراج قائمة السائقين من الـ snapshot
-      final Object? driversRaw = snapshot['drivers'];
-      if (driversRaw is! List) return;
+      final List<Driver> remoteDrivers = _driversFromSnapshot(snapshot);
+      if (remoteDrivers.isEmpty && snapshot['drivers'] is! List) return;
 
-      final List<Driver> remoteDrivers = driversRaw
-          .whereType<Map<Object?, Object?>>()
-          .map((Map<Object?, Object?> item) =>
-              Driver.fromJson(Map<String, dynamic>.from(item)))
-          .toList();
+      final List<Driver> localDrivers = await DriverStorage.loadDrivers();
+      final List<Driver> merged = _mergeOrders(
+        base: remoteDrivers,
+        other: localDrivers,
+        since: _lastCloudSnapshotAt,
+      );
+      _lastCloudSnapshotAt = DateTime.now();
 
       // حفظ البيانات الواردة محلياً
-      await DriverStorage.saveDrivers(remoteDrivers);
+      await DriverStorage.saveDrivers(merged);
 
       // الإعلام بالتحديث الجديد
       await notifyChanges();
       debugPrint(
-          '[FirebaseTracking] بيانات مُطبَّقة من Firebase: ${remoteDrivers.length} سائق');
+          '[FirebaseTracking] بيانات مُطبَّقة من Firebase: ${merged.length} سائق');
     } catch (e) {
       debugPrint('[FirebaseTracking] _applyRemoteSnapshot خطأ: $e');
     }
+  }
+
+  /// استخراج قائمة العمال من لقطة سحابية.
+  static List<Driver> _driversFromSnapshot(Map<String, dynamic> snapshot) {
+    final Object? driversRaw = snapshot['drivers'];
+    if (driversRaw is! List) return <Driver>[];
+    return driversRaw
+        .whereType<Map<Object?, Object?>>()
+        .map((Map<Object?, Object?> item) =>
+            Driver.fromJson(Map<String, dynamic>.from(item)))
+        .toList();
+  }
+
+  /// دمج قائمة عمال مع أخرى مع الحفاظ على الطلبات الجديدة غير المقروءة.
+  ///
+  /// * [base] القائمة الأساس (التي سنكتبها أو التي سنطبّقها).
+  /// * [other] القائمة الأخرى (السحابة عند الكتابة، أو الجهاز عند القراءة).
+  /// * [since] علامة زمنية: الطلبات الأحدث منها فقط تُعدّ «جديدة» وتُدمج،
+  ///   لذلك لا يعود طلب حذفه المدير إلى الظهور.
+  static List<Driver> _mergeOrders({
+    required List<Driver> base,
+    required List<Driver> other,
+    required DateTime since,
+  }) {
+    final List<Driver> result = List<Driver>.of(base);
+    for (final Driver extra in other) {
+      final int index = result.indexWhere(
+        (Driver driver) =>
+            (driver.pin.isNotEmpty && driver.pin == extra.pin) ||
+            StaffMember.normalizeUsername(driver.name) ==
+                StaffMember.normalizeUsername(extra.name),
+      );
+      if (index == -1) {
+        // عامل غير موجود في الأساس: نضيفه فقط إن كان يحمل طلباً جديداً.
+        if (extra.orders.any((DeliveryOrder o) => o.addedAt.isAfter(since))) {
+          result.add(extra);
+        }
+        continue;
+      }
+      final Driver target = result[index];
+      final Set<String> knownIds =
+          target.orders.map((DeliveryOrder order) => order.id).toSet();
+      final List<DeliveryOrder> newcomers = extra.orders
+          .where((DeliveryOrder order) =>
+              !knownIds.contains(order.id) && order.addedAt.isAfter(since))
+          .toList();
+      if (newcomers.isEmpty) continue;
+      result[index] = target.copyWith(
+        orders: <DeliveryOrder>[...target.orders, ...newcomers],
+      );
+    }
+    return result;
   }
 
   // ─── المنطق الداخلي ───────────────────────────────────────────────────────
@@ -321,20 +385,51 @@ class FirebaseTrackingService {
   /// يُرسل snapshot شامل يحتوي على قائمة السائقين كاملة، مع:
   /// - [restaurantId] لضمان العزل التام
   /// - timestamp للإعلام بوجود تغيير
+  ///
+  /// **حماية من الكتابة فوق العامل:** قبل الكتابة تُقرأ اللقطة السحابية
+  /// وتُضم طلبات الأجهزة الأخرى الجديدة ([_mergeOrders])، وتُكتب محمية
+  /// بـ `ETag`؛ فإن تغيّر المستند في اللحظة الفاصلة (412) نُعيد القراءة
+  /// والدمج ثم نحاول مرة أخرى.
   Future<void> _syncToFirebase(List<Driver> drivers) async {
     if (!FirebaseRealtimeService.instance.isConfigured) return;
 
     try {
-      final Map<String, dynamic> snapshot = <String, dynamic>{
-        'restaurantId': RestaurantService.restaurantId,
-        'updatedAt': DateTime.now().toIso8601String(),
-        'drivers': drivers.map((Driver d) => d.toJson()).toList(),
-      };
+      List<Driver> outgoing = List<Driver>.of(drivers);
 
-      final bool ok =
-          await FirebaseRealtimeService.instance.pushSnapshot(snapshot);
-      if (ok) {
-        debugPrint('[FirebaseTracking] sync ✅ — ${drivers.length} سائق');
+      for (int attempt = 0; attempt < 2; attempt++) {
+        final Map<String, dynamic>? remote =
+            await FirebaseRealtimeService.instance.fetchSnapshot();
+        if (remote != null) {
+          outgoing = _mergeOrders(
+            base: outgoing,
+            other: _driversFromSnapshot(remote),
+            since: _lastCloudSnapshotAt,
+          );
+        }
+
+        final Map<String, dynamic> snapshot = <String, dynamic>{
+          'restaurantId': RestaurantService.restaurantId,
+          'updatedAt': DateTime.now().toIso8601String(),
+          'drivers': outgoing.map((Driver d) => d.toJson()).toList(),
+        };
+
+        final SnapshotPushOutcome outcome = await FirebaseRealtimeService
+            .instance
+            .pushSnapshotGuarded(snapshot);
+
+        if (outcome == SnapshotPushOutcome.success) {
+          // إثبات الدمج محلياً حتى تتفق الواجهة مع السحابة.
+          await DriverStorage.saveDrivers(outgoing);
+          await notifyChanges();
+          debugPrint('[FirebaseTracking] sync ✅ — ${outgoing.length} سائق');
+          return;
+        }
+        if (outcome == SnapshotPushOutcome.failure) {
+          debugPrint('[FirebaseTracking] sync فشل — سيُعاد في الدورة القادمة');
+          return;
+        }
+        // conflict: جهاز آخر كتب مستنداً أحدث → أعِد القراءة والدمج.
+        debugPrint('[FirebaseTracking] تعارض — إعادة المحاولة بعد الدمج');
       }
     } catch (e) {
       debugPrint('[FirebaseTracking] _syncToFirebase خطأ: $e');

@@ -150,6 +150,9 @@ void main() {
   tearDown(() async {
     FirebaseRealtimeService.instance.dispose();
     await AppSettings.setFirebaseDatabaseUrl('');
+    // مهلة قصيرة ليُكمل أي طلب غير مُنتظَر (كتابة/فحص heartbeat) قبل إغلاق
+    // الخادم، فلا تظهر أخطاء اتصال مضللة في السجل.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
     await server.stop();
   });
 
@@ -510,6 +513,174 @@ void main() {
       expect(dataLine, contains('$stamp'));
     },
     timeout: const Timeout(Duration(minutes: 1)),
+  );
+
+  test(
+    'كتابة المدير لا تُلغي طلباً أرسله العامل (دمج + ETag 412)',
+    () async {
+      await _startManagerApp(server, _rid1);
+      final Driver driver = (await DriverStorage.loadDrivers()).single;
+
+      // ① المدير ينشئ طلباً من جهازه ويرفعه للسحابة.
+      final DeliveryOrder managerOrder = DeliveryOrder(
+        orderNumber: 'M-01',
+        amount: 6000,
+        driverPin: driver.pin,
+        driverName: driver.name,
+      );
+      await DriverStorage.saveDriver(driver.addDeliveryOrder(managerOrder));
+      await _managerPushAndWait(server, _rid1, managerOrder.id);
+      final Driver managerDriver = (await DriverStorage.loadDrivers()).single;
+
+      // ② العامل (الويب) يرسل طلباً آخر إلى نفس المطعم.
+      final WorkerWebService worker = WorkerWebService(
+        databaseUrl: server.baseUrl,
+        restaurantId: _rid1,
+      );
+      final StaffAuthResult auth = await worker.authenticate(
+        username: _driverName,
+        secret: _workerPassword,
+      );
+      expect(auth.success, isTrue, reason: auth.message);
+      expect(
+        await worker.createOrder(
+          driverPin: auth.staff!.driverPin,
+          driverName: auth.staff!.name,
+          orderNumber: 'W-01',
+          amount: 5000,
+          paymentType: OrderPaymentType.cash,
+        ),
+        isTrue,
+      );
+
+      // ③ المدير لا يزال لا يعرف بطلب العامل (نُعيد حالته المحلية القديمة)
+      //    ثم يكتب من جهازه — وهنا كان يُفقد طلب العامل قبل الإصلاح.
+      await DriverStorage.saveDriver(
+        managerDriver.copyWith(orders: <DeliveryOrder>[managerOrder]),
+      );
+
+      // ④ نُجبر أيضاً تعارض ETag حقيقياً أثناء كتابة المدير لنتحقق من التعافي.
+      bool canceledOnce = false;
+      server.onBeforePut = (String path) {
+        if (!canceledOnce && path.endsWith('/snapshot')) {
+          canceledOnce = true;
+          server.invalidateEtag(path);
+        }
+      };
+      addTearDown(() => server.onBeforePut = null);
+      final int conflictsBefore = server.conflictCount;
+      final int writesBefore = server.writeCount;
+
+      expect(
+        await FirebaseTrackingService.instance.markOrderPickedUp(
+          orderId: managerOrder.id,
+        ),
+        isTrue,
+      );
+
+      // ⑤ ننتظر اكتمال كتابة المدير فعلياً: طلبه + طلب العامل المدموج محلياً
+      //    (الدمج المحلي لا يحدث إلا بعد نجاح الكتابة، فهو دليل اكتمالها).
+      await _waitUntil(() async {
+        if (server.writeCount <= writesBefore) return false;
+        final List<DeliveryOrder> orders = await _managerOrdersFor(driver.pin);
+        return orders.any((DeliveryOrder o) => o.orderNumber == 'W-01') &&
+            orders.any((DeliveryOrder o) => o.orderNumber == 'M-01');
+      }, reason: 'لم تُكمل كتابة المدير دمج طلب العامل');
+
+      // ⑥ لا فقدان في السحابة: الطلبان موجودان.
+      final String cloudSnapshot =
+          jsonEncode(server.read('restaurants/$_rid1/snapshot'));
+      expect(cloudSnapshot, contains('W-01'));
+      expect(cloudSnapshot, contains('M-01'));
+
+      // ⑦ وتعارض ETag حقيقي حدث فعلاً ثم تعافى الكود بإعادة القراءة والدمج.
+      expect(server.conflictCount, greaterThan(conflictsBefore));
+
+      // ⑧ والعامل يرى الطلبين أيضاً.
+      final List<DeliveryOrder> workerOrders = await worker.loadOrders(
+        driverPin: auth.staff!.driverPin,
+        driverName: auth.staff!.name,
+      );
+      expect(
+        workerOrders.map((DeliveryOrder o) => o.orderNumber),
+        containsAll(<String>['M-01', 'W-01']),
+      );
+    },
+    timeout: const Timeout(Duration(minutes: 3)),
+  );
+
+  test(
+    'طلب حذفه المدير لا يعود للظهور بعد الدمج (العلامة الزمنية)',
+    () async {
+      await _startManagerApp(server, _rid1);
+      final Driver driver = (await DriverStorage.loadDrivers()).single;
+
+      // ① طلب قديم للمدير يُرفع للسحابة.
+      final DeliveryOrder oldOrder = DeliveryOrder(
+        orderNumber: 'M-OLD',
+        amount: 2000,
+        driverPin: driver.pin,
+        driverName: driver.name,
+        addedAt: DateTime.now().subtract(const Duration(minutes: 5)),
+      );
+      await DriverStorage.saveDriver(driver.addDeliveryOrder(oldOrder));
+      await _managerPushAndWait(server, _rid1, oldOrder.id);
+
+      // ② العامل يضيف طلباً جديداً → المدير يستقبله (تتحرك العلامة الزمنية).
+      final WorkerWebService worker = WorkerWebService(
+        databaseUrl: server.baseUrl,
+        restaurantId: _rid1,
+      );
+      expect(
+        await worker.createOrder(
+          driverPin: driver.pin,
+          driverName: driver.name,
+          orderNumber: 'W-NEW',
+          amount: 3000,
+          paymentType: OrderPaymentType.cash,
+        ),
+        isTrue,
+      );
+      await _waitUntil(() async {
+        final List<DeliveryOrder> orders = await _managerOrdersFor(driver.pin);
+        return orders.any((DeliveryOrder o) => o.orderNumber == 'W-NEW');
+      }, reason: 'المدير لم يستقبل طلب العامل الجديد');
+
+      // ③ المدير يحذف الطلب القديم محلياً (كما يفعل من سجل الطلبات)
+      //    ثم يدفع تغييره للسحابة.
+      final List<DeliveryOrder> beforeDelete = await _managerOrdersFor(
+        driver.pin,
+      );
+      final DeliveryOrder freshOrder = beforeDelete.firstWhere(
+        (DeliveryOrder o) => o.orderNumber == 'W-NEW',
+      );
+      await DriverStorage.saveDrivers(<Driver>[
+        driver.copyWith(
+          orders: beforeDelete
+              .where((DeliveryOrder o) => o.id != oldOrder.id)
+              .toList(),
+        ),
+      ]);
+      expect(
+        await FirebaseTrackingService.instance.markOrderPickedUp(
+          orderId: freshOrder.id,
+        ),
+        isTrue,
+      );
+
+      // ④ الطلب المحذوف لا يعود، والجديد محفوظ — في الجهاز وفي السحابة.
+      await _waitUntil(() async {
+        final List<DeliveryOrder> orders = await _managerOrdersFor(driver.pin);
+        return !orders.any((DeliveryOrder o) => o.orderNumber == 'M-OLD') &&
+            orders.any((DeliveryOrder o) => o.orderNumber == 'W-NEW');
+      }, reason: 'الطلب المحذوف عاد للظهور محلياً بعد الدمج');
+      await _waitUntil(
+        () async => !jsonEncode(server.read('restaurants/$_rid1/snapshot'))
+            .contains('M-OLD'),
+        reason: 'الطلب المحذوف ما زال في السحابة',
+      );
+    },
+    timeout: const Timeout(Duration(minutes: 3)),
   );
 }
 

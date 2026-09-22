@@ -120,11 +120,17 @@ class StaffSessionService {
     aOptions: AndroidOptions(resetOnError: true),
   );
 
+  /// مهلة عمليات التخزين الآمن: إذا تعذّرت الإضافة أو تعطّل Keystore لا
+  /// نتوقف إلى الأبد — نكمل بالنسخة الاحتياطية ونترك المستخدم يكمل عمله.
+  static const Duration _secureTimeout = Duration(seconds: 4);
+
   /// حفظ جلسة الموظف بعد تسجيل دخول ناجح.
   static Future<void> saveSession(StaffSession session) async {
     final String payload = jsonEncode(session.toJson());
     try {
-      await _secure.write(key: sessionKey, value: payload);
+      await _secure
+          .write(key: sessionKey, value: payload)
+          .timeout(_secureTimeout);
     } catch (e) {
       debugPrint('[StaffSession] التخزين الآمن غير متوفر — نسخة احتياطية: $e');
       final SharedPreferences prefs = await SharedPreferences.getInstance();
@@ -136,7 +142,9 @@ class StaffSessionService {
   static Future<StaffSession?> restore() async {
     String? payload;
     try {
-      payload = await _secure.read(key: sessionKey);
+      payload = await _secure
+          .read(key: sessionKey)
+          .timeout(_secureTimeout, onTimeout: () => null);
     } catch (e) {
       debugPrint('[StaffSession] قراءة التخزين الآمن فشلت: $e');
     }
@@ -169,7 +177,7 @@ class StaffSessionService {
   /// مسح الجلسة تماماً (تسجيل الخروج).
   static Future<void> clear() async {
     try {
-      await _secure.delete(key: sessionKey);
+      await _secure.delete(key: sessionKey).timeout(_secureTimeout);
     } catch (_) {
       // لا مشكلة — نكمل لمسح النسخة الاحتياطية.
     }
