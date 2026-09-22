@@ -65,7 +65,7 @@ class _DriverShiftHistoryScreenState extends State<DriverShiftHistoryScreen> {
     }
 
     // إذا لم يوجد سجل تاريخي بعد، نولد سجلاً حياً من طلبات السائق الحالية
-    final Driver? driver = _drivers.firstWhere(
+    final Driver driver = _drivers.firstWhere(
       (Driver d) => d.pin == _selectedPin,
       orElse: () => const Driver(name: ''),
     );

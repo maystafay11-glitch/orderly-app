@@ -271,8 +271,8 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
         : DriverDashboardScreen(driver: driver!);
     Navigator.of(context).pushReplacement(
       PageRouteBuilder<void>(
-        pageBuilder: (_, __, ___) => target,
-        transitionsBuilder: (_, Animation<double> anim, __, Widget child) {
+        pageBuilder: (_, _, _) => target,
+        transitionsBuilder: (_, Animation<double> anim, _, Widget child) {
           return FadeTransition(opacity: anim, child: child);
         },
         transitionDuration: const Duration(milliseconds: 500),
@@ -334,8 +334,8 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
       if (result.role == UserRole.admin) {
         Navigator.of(context).pushReplacement(
           PageRouteBuilder<void>(
-            pageBuilder: (_, __, ___) => const HomeScreen(),
-            transitionsBuilder: (_, Animation<double> anim, __, Widget child) {
+            pageBuilder: (_, _, _) => const HomeScreen(),
+            transitionsBuilder: (_, Animation<double> anim, _, Widget child) {
               return FadeTransition(opacity: anim, child: child);
             },
             transitionDuration: const Duration(milliseconds: 500),
@@ -344,9 +344,9 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen>
       } else if (result.role == UserRole.driver && result.driver != null) {
         Navigator.of(context).pushReplacement(
           PageRouteBuilder<void>(
-            pageBuilder: (_, __, ___) =>
+            pageBuilder: (_, _, _) =>
                 DriverDashboardScreen(driver: result.driver!),
-            transitionsBuilder: (_, Animation<double> anim, __, Widget child) {
+            transitionsBuilder: (_, Animation<double> anim, _, Widget child) {
               return FadeTransition(opacity: anim, child: child);
             },
             transitionDuration: const Duration(milliseconds: 500),
@@ -438,7 +438,7 @@ class _AnimatedBackground extends StatelessWidget {
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: controller,
-      builder: (_, __) => CustomPaint(
+      builder: (_, _) => CustomPaint(
         painter: _ParticlePainter(controller.value),
         size: Size.infinite,
       ),

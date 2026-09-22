@@ -58,19 +58,42 @@ flutter run      # يحتاج جهازاً/محاكياً بكاميرا لتج�
 
 ## Worker Web App (iPhone)
 
-هذه نسخة ويب مستقلة للعامل فقط؛ لا تحتوي على لوحة المدير أو إعداداته. تستخدم
-نفس مسار Firebase الخاص بالـ APK (`restaurants/{Restaurant ID}/snapshot`) كي
-تتزامن الطلبات وحالاتها كل 3 ثوانٍ تقريباً في الاتجاهين.
+نسخة الويب مخصّصة للعامل فقط ولا تعرض لوحة المدير حتى عند البناء الافتراضي
+(`lib/main.dart` على الويب يفتح بوابة العامل حصراً). المزامنة تتم على نفس مسار
+الـ APK: `restaurants/{Restaurant ID}/snapshot` و`heartbeat`، عبر بث SSE مع
+فحص heartbeat كل ثانيتين في الاتجاهين.
 
 ```bash
 flutter build web --target lib/worker_web_main.dart --dart-define=FIREBASE_DATABASE_URL=https://YOUR_DATABASE.firebaseio.com
 ```
 
-انشر محتويات `build/web` على أي استضافة HTTPS. يدخل العامل `Restaurant ID`
-واسم المستخدم وكلمة المرور أو PIN، ويمكنه إنشاء طلب وإرفاق صورة من كاميرا
-iPhone. يجب أن يكون حساب العامل موجوداً في Firebase تحت:
-`restaurants/{Restaurant ID}/staff/{staffId}`، وأن تسمح قواعد Firebase بالوصول
-المناسب للمطعم.
+انشر `build/web` على HTTPS (مطلوب لكاميرا آيفون). يدخل العامل `Restaurant ID`
+واسم المستخدم وكلمة المرور أو PIN. إن لم يُضمَّن الرابط عند البناء يمكن تمريره
+بـ `?db=` أو إدخاله في شاشة الدخول. التقاط الصورة يستخدم `capture=environment`
+المناسب لسفاري. الحساب يجب أن يوجد تحت:
+`restaurants/{Restaurant ID}/staff/{staffId}`.
+
+## اختبارات التكامل الشبكي (Firebase)
+
+يشغّل `test/worker_firebase_integration_test.dart` خادم HTTP محلياً يحاكي
+Firebase Realtime Database بعقوده الحقيقية (REST + `ETag`/`If-Match` + بث
+`SSE`)، ثم يمرّر عليه **نفس كود الطرفين**: خدمة العامل على الويب
+(`WorkerWebService`) وتطبيق المدير (`FirebaseTrackingService` +
+`FirebaseRealtimeService`) عبر HTTP فعلي، ويتحقق من:
+
+- تسجيل دخول العامل بالشبكة مع عزل تام بين مطعمين بنفس الاسم وكلمة المرور.
+- المزامنة الاتجاهية: طلب المدير يظهر عند العامل، وطلب العامل يظهر عند المدير.
+- عقد `ETag/If-Match`: رفض الكتابة القديمة بـ 412 ثم نجاح إعادة محاولة العامل
+  دون فقدان أي طلب.
+- عقد بث `SSE` (`event: put` على `heartbeat.json`) الذي يستهلكه `EventSource`
+  في متصفح الآيفون.
+
+```bash
+flutter test test/worker_firebase_integration_test.dart
+```
+
+خادم المحاكاة موجود في `test/support/fake_firebase_rtdb.dart` (لا يُشغَّل في
+اختبارات الوحدة العادية).
 
 ## ملاحظات
 

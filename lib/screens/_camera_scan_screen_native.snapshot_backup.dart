@@ -868,7 +868,7 @@ class _CameraScanScreenState extends State<CameraScanScreen>
     final String? finalNumber = orderNumber ?? _capturedOrderNumber;
 
     final List<double> distinctAmounts = <double>[
-      if (finalPrice != null) finalPrice,
+      ?finalPrice,
       ..._accumulatedAmounts.where((double a) => a != finalPrice),
     ];
 

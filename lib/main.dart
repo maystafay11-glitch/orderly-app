@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -5,9 +6,16 @@ import 'package:orderly_app/screens/app_auth_gate.dart';
 import 'package:orderly_app/services/firebase_tracking_service.dart';
 import 'package:orderly_app/services/restaurant_service.dart';
 import 'package:orderly_app/theme/app_theme.dart';
+import 'package:orderly_app/worker_web_main.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // نسخة الويب للعامل فقط — لا تُعرض لوحة المدير في المتصفح أبداً.
+  if (kIsWeb) {
+    runWorkerWebApp();
+    return;
+  }
 
   // ── تهيئة إلزامية قبل runApp ──────────────────────────────────────────────
 

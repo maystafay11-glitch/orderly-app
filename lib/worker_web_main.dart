@@ -2,9 +2,12 @@ import 'package:flutter/material.dart';
 
 import 'package:orderly_app/screens/worker_web_screen.dart';
 
-/// Standalone worker-only web entrypoint.
-/// Build with: flutter build web --target lib/worker_web_main.dart
-void main() {
+/// نقطة دخول مستقلة لواجهة العامل على الويب فقط.
+/// البناء: `flutter build web --target lib/worker_web_main.dart`
+void main() => runWorkerWebApp();
+
+void runWorkerWebApp() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const WorkerWebApp());
 }
 

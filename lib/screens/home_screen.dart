@@ -306,7 +306,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       child: ListView.separated(
                         shrinkWrap: true,
                         itemCount: _generalOrders.length,
-                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        separatorBuilder: (_, _) => const Divider(height: 1),
                         itemBuilder: (BuildContext _, int index) {
                           final DeliveryOrder order = _generalOrders[index];
                           return ListTile(
